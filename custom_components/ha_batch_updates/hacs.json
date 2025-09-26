@@ -1,7 +1,0 @@
-{
-  "name": "Batch Updates (Sidebar)",
-  "content_in_root": false,
-  "render_readme": true,
-  "domains": ["ha_batch_updates"],
-  "homeassistant": "2024.6.0"
-}
