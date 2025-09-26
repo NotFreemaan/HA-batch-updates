@@ -1,1 +1,10 @@
-
+{
+  "domain": "ha_batch_updates",
+  "name": "Batch Updates (Sidebar)",
+  "version": "0.2.0",
+  "documentation": "https://github.com/NotFreemaan/ha-batch-updates",
+  "requirements": [],
+  "codeowners": ["@yourname"],
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/NotFreemaan/ha-batch-updates/issues"
+}
