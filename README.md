@@ -12,7 +12,7 @@ Adds a **sidebar panel** that lists all `update.*` entities with updates availab
 
 ## Install (HACS – Custom Repository)
 1. In HA, go to **HACS → Integrations → ⋮ → Custom repositories**.
-2. Add your repo URL (e.g., `https://github.com/yourname/ha-batch-updates`) with category **Integration**.
+2. Add your repo URL (e.g., `https://github.com/NotFreemaan/ha-batch-updates`) with category **Integration**.
 3. Install **Batch Updates (Sidebar)**.
 4. **Restart Home Assistant**.
 5. Open **Batch Updates** in the sidebar.
