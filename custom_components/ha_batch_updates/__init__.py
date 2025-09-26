@@ -15,7 +15,7 @@ DOMAIN = "ha_batch_updates"
 PANEL_URL_PATH = "batch-updates"
 STATIC_URL = f"/{DOMAIN}"
 PANEL_TITLE = "Batch Updates"
-PANEL_ICON = "mdi:update"
+PANEL_ICON = "mdi:package-up"
 
 LOG_STORE_VERSION = 1
 LOG_STORE_FILENAME = f"{DOMAIN}_log.json"
