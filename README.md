@@ -29,3 +29,15 @@ Adds a **sidebar panel** that lists all `update.*` entities with updates availab
 
 ## Service
 You can also trigger via service:
+domain: ha_batch_updates
+service: run
+service_data:
+entities:
+- update.some_addon
+- update.some_integration
+backup: true
+reboot_host: false
+
+## Notes
+- Backup support depends on the underlying entity; we pass `backup: true` to `update.install` where supported.
+- Host reboot requires HA OS/Supervised. Otherwise the integration triggers a **Home Assistant core restart**.
