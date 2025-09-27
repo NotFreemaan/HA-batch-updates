@@ -28,6 +28,9 @@ LOG_STORE_VERSION = 1
 LOG_STORE_FILENAME = f"{DOMAIN}_log.json"
 LOG_MAX_ENTRIES = 500
 
+# UpdateEntity feature flag (INSTALL)
+SUPPORT_INSTALL = 1  # bit 0
+
 
 class UpdateLog:
     def __init__(self, hass: HomeAssistant):
@@ -111,6 +114,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         ordered = first + last
 
         batch_id = _utcnow()
+
         for ent in ordered:
             st = hass.states.get(ent)
             if not st:
@@ -125,22 +129,33 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             name = st.attributes.get("friendly_name") or ent
             cur = st.attributes.get("installed_version")
             tgt = st.attributes.get("latest_version")
+            feats = int(st.attributes.get("supported_features", 0))
+
+            if (feats & SUPPORT_INSTALL) == 0:
+                await _log_item(
+                    hass, log, batch_id, ent, "skipped_unsupported_install",
+                    f"This entity does not support install (supported_features={feats})."
+                )
+                continue
 
             await _log_item(
                 hass, log, batch_id, ent, "started", "Starting update",
                 extra={"name": name, "from": cur, "to": tgt, "backup": backup_flag}
             )
 
+            # Call update.install — use blocking=True to let HA finish the handler.
             try:
                 await hass.services.async_call(
-                    "update", "install", {"entity_id": ent, "backup": backup_flag}, blocking=False
+                    "update", "install",
+                    {"entity_id": ent, "backup": backup_flag},
+                    blocking=True,  # fire and wait for handler to return
                 )
             except Exception as e:
                 await _log_item(hass, log, batch_id, ent, "failed_service_error", str(e))
                 _notify(hass, f"{name}: service error: {e}. Halting batch.")
                 return
 
-            # Give the entity a moment to flip to in_progress/state transitions
+            # Give integration time to flip in_progress/state.
             await asyncio.sleep(1)
 
             ok, reason = await _wait_update_complete(hass, ent, timedelta(minutes=30))
@@ -154,7 +169,10 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
                 await _log_item(hass, log, batch_id, ent, "success", "Updated successfully")
                 _logbook(hass, f"{name} updated successfully.")
             else:
-                await _log_item(hass, log, batch_id, ent, "success_finished_versions", f"installed={st2.attributes.get('installed_version')} latest={st2.attributes.get('latest_version')}")
+                await _log_item(
+                    hass, log, batch_id, ent, "success_finished_versions",
+                    f"installed={st2.attributes.get('installed_version')} latest={st2.attributes.get('latest_version')} state={st2.state}"
+                )
                 _logbook(hass, f"{name} appears updated (versions match), entity still reporting {st2.state!r}.")
 
         _notify(hass, "Batch complete. Use the Reboot now button if required.")
@@ -208,8 +226,14 @@ async def _log_item(
         "result": result,
         "reason": reason,
         "ts": _utcnow(),
+        "state": st.state if st else None,
+        "in_progress": st.attributes.get("in_progress") if st else None,
+        "installed_version": st.attributes.get("installed_version") if st else None,
+        "latest_version": st.attributes.get("latest_version") if st else None,
+        "supported_features": st.attributes.get("supported_features") if st else None,
     }
-    if extra: base.update(extra)
+    if extra:
+        base.update(extra)
     await log.async_append(base)
     _LOGGER.info("BatchUpdates LOG: %s", base)
 
@@ -219,49 +243,82 @@ def _utcnow() -> str:
 
 
 def _version_tuple(v: str | None) -> tuple:
-    if not v: return tuple()
+    if not v:
+        return tuple()
     parts = []
     for p in str(v).split("."):
-        try: parts.append(int(p))
-        except: parts.append(p)
+        try:
+            parts.append(int(p))
+        except Exception:
+            parts.append(p)
     return tuple(parts)
+
 
 @callback
 def _done_by_versions(st) -> bool:
     """Treat as done if installed_version >= latest_version and not in_progress."""
-    if not st: return False
+    if not st:
+        return False
     in_prog = st.attributes.get("in_progress", False)
-    if in_prog: return False
+    if in_prog:
+        return False
     installed = _version_tuple(st.attributes.get("installed_version"))
     latest = _version_tuple(st.attributes.get("latest_version"))
-    if not latest: return False
-    if not installed: return False
+    if not latest or not installed:
+        return False
     return installed >= latest
 
 
 async def _wait_update_complete(hass: HomeAssistant, ent: str, timeout: timedelta) -> Tuple[bool, str | None]:
+    """
+    Wait for completion using two mechanisms:
+    1) state_changed subscription
+    2) periodic polling + update_entity to force a refresh
+    """
     done: asyncio.Future = asyncio.get_event_loop().create_future()
 
     @callback
     def _ok() -> Tuple[bool, str | None]:
         st = hass.states.get(ent)
-        if st is None: return False, "entity_disappeared"
-        if st.state == "off": return True, None
+        if st is None:
+            return False, "entity_disappeared"
+        if st.state == "off":
+            return True, "state_off"
         if _done_by_versions(st):
             return True, "versions_reached"
-        # Still considered running
         return False, None
 
     ok, reason = _ok()
-    if ok: return True, reason
+    if ok:
+        return True, reason
 
     @callback
     def _listener(event):
-        if event.data.get("entity_id") != ent: return
+        if event.data.get("entity_id") != ent:
+            return
         ok2, r2 = _ok()
-        if ok2 and not done.done(): done.set_result((True, r2))
+        if ok2 and not done.done():
+            done.set_result((True, r2))
 
     remove = async_track_state_change_event(hass, [ent], _listener)
+
+    async def _poller():
+        try:
+            while not done.done():
+                # Force the entity to refresh in case the integration doesn't push quickly
+                hass.async_create_task(
+                    hass.services.async_call("homeassistant", "update_entity", {"entity_id": ent}, blocking=False)
+                )
+                ok2, r2 = _ok()
+                if ok2:
+                    done.set_result((True, r2))
+                    return
+                await asyncio.sleep(5)
+        except Exception as e:
+            _LOGGER.warning("Poller error for %s: %s", ent, e)
+
+    poll_task = asyncio.create_task(_poller())
+
     try:
         res = await asyncio.wait_for(done, timeout.total_seconds())
         return res
@@ -269,6 +326,9 @@ async def _wait_update_complete(hass: HomeAssistant, ent: str, timeout: timedelt
         return False, "timeout"
     finally:
         remove()
+        poll_task.cancel()
+        with contextlib.suppress(Exception):
+            await poll_task
 
 
 @websocket_api.websocket_command(
@@ -295,3 +355,14 @@ async def async_setup_entry(hass, entry):
 
 async def async_unload_entry(hass, entry):
     return True
+
+
+# ---- stdlib contextlib fallback (tiny shim) ----
+try:
+    import contextlib  # noqa: F401
+except Exception:
+    class contextlib:  # type: ignore
+        class suppress:
+            def __init__(self, *exc): pass
+            def __enter__(self): return self
+            def __exit__(self, *exc): return True
