@@ -1,7 +1,33 @@
-// Batch Updates panel – robust mount for various HA loader contracts (with logging)
+// Batch Updates panel – robust mount for various HA loader contracts (waits for hassConnection, with logging)
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
+/* ---------------- Helpers: get a HA connection safely ---------------- */
+async function getHAConnection(timeoutMs = 15000) {
+  // Preferred: window.hassConnection (a Promise from HA)
+  const start = Date.now();
+
+  // Poll for either window.hassConnection or <home-assistant>.hass.connection
+  while (Date.now() - start < timeoutMs) {
+    try {
+      if (window.hassConnection && typeof window.hassConnection.then === "function") {
+        const { conn } = await window.hassConnection;
+        if (conn) return conn;
+      }
+    } catch (_) {}
+
+    try {
+      const haEl = document.querySelector("home-assistant");
+      const conn = haEl?.hass?.connection || haEl?.hass?.conn || haEl?.__hass?.connection;
+      if (conn) return conn;
+    } catch (_) {}
+
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("hassConnection not available after timeout");
+}
+
+/* ---------------- Web Component ---------------- */
 class BatchUpdatesPanel extends HTMLElement {
   constructor() {
     super();
@@ -11,61 +37,74 @@ class BatchUpdatesPanel extends HTMLElement {
     this._reboot = false;
     this._backup = true; // default: make backups
     this._log = [];
+    this._unsub = null;
+    this._conn = null;
   }
 
   connectedCallback() {
     console.info("[Batch Updates] connectedCallback");
-    this.render();
-    this._subscribe();
+    this.render(); // initial shell
+    this._init();  // async init
   }
   disconnectedCallback() { if (this._unsub) this._unsub(); }
 
-  async _subscribe() {
+  async _init() {
     try {
-      const { conn } = await window.hassConnection; // HA provides this
+      this._conn = await getHAConnection(20000);
       console.info("[Batch Updates] hassConnection ready");
-      const resp = await conn.sendMessagePromise({ type: "get_states" });
-      this._states = Object.fromEntries(resp.map(s => [s.entity_id, s]));
-      await this._loadLog();
-      this.render();
-
-      // live updates
-      this._unsub = await conn.subscribeMessage(evt => {
-        const ent = evt?.event?.data?.entity_id;
-        if (ent && ent.startsWith("update.")) {
-          conn.sendMessagePromise({ type: "get_states" }).then(all => {
-            this._states = Object.fromEntries(all.map(s => [s.entity_id, s]));
-            this.render();
-          });
-        }
-      }, { type: "subscribe_events", event_type: "state_changed" });
+      await this._subscribe();
     } catch (e) {
-      console.error("[Batch Updates] subscribe error:", e);
+      console.error("[Batch Updates] could not obtain hassConnection:", e);
       this.shadowRoot.innerHTML = `
         <div style="padding:16px">
-          <p>Home Assistant connection not ready yet. Try reloading the page.</p>
-          <pre style="white-space:pre-wrap">${String(e)}</pre>
+          <h3>Home Assistant connection not ready</h3>
+          <p>Try reloading this page, or restarting Home Assistant's frontend.</p>
+          <details><summary>Error</summary><pre style="white-space:pre-wrap">${String(e)}</pre></details>
         </div>`;
     }
   }
 
+  async _subscribe() {
+    const conn = this._conn;
+    // Load initial states
+    const resp = await conn.sendMessagePromise({ type: "get_states" });
+    this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
+    await this._loadLog();
+    this.render();
+
+    // Subscribe to live updates
+    this._unsub = await conn.subscribeMessage(
+      (evt) => {
+        const ent = evt?.event?.data?.entity_id;
+        if (ent && ent.startsWith("update.")) {
+          conn.sendMessagePromise({ type: "get_states" }).then((all) => {
+            this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
+            this.render();
+          });
+        }
+      },
+      { type: "subscribe_events", event_type: "state_changed" }
+    );
+  }
+
   async _loadLog(limit = 100) {
-    const { conn } = await window.hassConnection;
-    const res = await conn.sendMessagePromise({ type: "ha_batch_updates/get_log", limit });
+    const res = await this._conn.sendMessagePromise({ type: "ha_batch_updates/get_log", limit });
     this._log = res.entries || [];
   }
   async _clearLog() {
-    const { conn } = await window.hassConnection;
-    await conn.sendMessagePromise({ type: "ha_batch_updates/clear_log" });
+    await this._conn.sendMessagePromise({ type: "ha_batch_updates/clear_log" });
     await this._loadLog();
     this.render();
   }
 
   _updatesList() {
     return Object.values(this._states)
-      .filter(s => s.entity_id?.startsWith?.("update.") && s.state === "on")
-      .sort((a, b) => (a.attributes.friendly_name || a.entity_id)
-        .localeCompare(b.attributes.friendly_name || b.entity_id));
+      .filter((s) => s.entity_id?.startsWith?.("update.") && s.state === "on")
+      .sort((a, b) =>
+        (a.attributes.friendly_name || a.entity_id).localeCompare(
+          b.attributes.friendly_name || b.entity_id
+        )
+      );
   }
 
   _togglePick(e) {
@@ -74,13 +113,12 @@ class BatchUpdatesPanel extends HTMLElement {
     else this._selected.delete(ent);
     this.render();
   }
-  _selectAll() { this._selected = new Set(this._updatesList().map(s => s.entity_id)); this.render(); }
+  _selectAll() { this._selected = new Set(this._updatesList().map((s) => s.entity_id)); this.render(); }
   _selectNone() { this._selected.clear(); this.render(); }
 
   async _run() {
     if (this._selected.size === 0) { alert("Select at least one update."); return; }
-    const { conn } = await window.hassConnection;
-    await conn.sendMessagePromise({
+    await this._conn.sendMessagePromise({
       type: "call_service",
       domain: "ha_batch_updates",
       service: "run",
@@ -88,7 +126,7 @@ class BatchUpdatesPanel extends HTMLElement {
         entities: Array.from(this._selected),
         reboot_host: this._reboot,
         backup: this._backup,
-      }
+      },
     });
     this._toast("Batch started. Logs will appear below.");
     setTimeout(async () => { await this._loadLog(); this.render(); }, 2000);
@@ -96,7 +134,7 @@ class BatchUpdatesPanel extends HTMLElement {
 
   _row(s) {
     const id = s.entity_id;
-       const name = s.attributes.friendly_name || id;
+    const name = s.attributes.friendly_name || id;
     const verTo = s.attributes.latest_version || "";
     const verFrom = s.attributes.installed_version || "";
     const inprog = s.attributes.in_progress === true;
@@ -158,7 +196,7 @@ class BatchUpdatesPanel extends HTMLElement {
 
           ${list.length === 0
             ? `<p>No updates available 🎉</p>`
-            : `<ul>${list.map(s => this._row(s)).join("")}</ul>`}
+            : `<ul>${list.map((s) => this._row(s)).join("")}</ul>`}
         </div>
 
         <div class="log">
@@ -170,7 +208,7 @@ class BatchUpdatesPanel extends HTMLElement {
           </div>
           <table>
             <thead><tr><th>Time (UTC)</th><th>Item</th><th>Result</th><th>Reason / Action</th></tr></thead>
-            <tbody>${this._log.slice().reverse().map(e => this._logRow(e)).join("")}</tbody>
+            <tbody>${this._log.slice().reverse().map((e) => this._logRow(e)).join("")}</tbody>
           </table>
         </div>
 
@@ -190,7 +228,6 @@ class BatchUpdatesPanel extends HTMLElement {
         .name{font-weight:600}
         .eid{opacity:.6;font-size:.9em}
         .ver{opacity:.8}
-
         .log{padding:0 16px 16px}
         .logbar{display:flex;align-items:center;margin:8px 0}
         table{width:100%;border-collapse:collapse}
@@ -206,7 +243,7 @@ class BatchUpdatesPanel extends HTMLElement {
     this.shadowRoot.innerHTML = html;
 
     const root = this.shadowRoot;
-    root.querySelectorAll('input[type="checkbox"][data-ent]').forEach(cb => {
+    root.querySelectorAll('input[type="checkbox"][data-ent]').forEach((cb) => {
       cb.addEventListener("change", (e) => this._togglePick(e));
     });
     root.getElementById("all").onclick = () => this._selectAll();
