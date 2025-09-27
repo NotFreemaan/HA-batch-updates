@@ -93,7 +93,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     schema = vol.Schema(
         {
             vol.Required("entities"): [str],
-            vol.Optional("reboot_host", default=False): bool,  # no longer used
+            vol.Optional("reboot_host", default=False): bool,  # kept for compatibility, not used
             vol.Optional("backup", default=True): bool,
         }
     )
@@ -105,7 +105,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             _LOGGER.warning("No entities provided to %s.run", DOMAIN)
             return
 
-        # Reorder: HA updates last
+        # Reorder: core last
         last = [e for e in entities if e.startswith("update.home_assistant_")]
         first = [e for e in entities if not e.startswith("update.home_assistant_")]
         ordered = first + last
@@ -140,10 +140,13 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
                 _notify(hass, f"{name}: service error: {e}. Halting batch.")
                 return
 
+            # Give the entity a moment to flip to in_progress/state transitions
+            await asyncio.sleep(1)
+
             ok, reason = await _wait_update_complete(hass, ent, timedelta(minutes=30))
             if not ok:
                 await _log_item(hass, log, batch_id, ent, "failed_timeout_or_incomplete", reason or "timeout")
-                _notify(hass, f"{name}: did not complete cleanly. Halting batch.")
+                _notify(hass, f"{name}: did not complete cleanly ({reason or 'timeout'}). Halting batch.")
                 return
 
             st2 = hass.states.get(ent)
@@ -151,9 +154,8 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
                 await _log_item(hass, log, batch_id, ent, "success", "Updated successfully")
                 _logbook(hass, f"{name} updated successfully.")
             else:
-                await _log_item(hass, log, batch_id, ent, "failed_unclear", f"final_state={st2.state if st2 else 'unknown'}")
-                _notify(hass, f"{name}: unclear completion. Halting batch.")
-                return
+                await _log_item(hass, log, batch_id, ent, "success_finished_versions", f"installed={st2.attributes.get('installed_version')} latest={st2.attributes.get('latest_version')}")
+                _logbook(hass, f"{name} appears updated (versions match), entity still reporting {st2.state!r}.")
 
         _notify(hass, "Batch complete. Use the Reboot now button if required.")
 
@@ -216,6 +218,27 @@ def _utcnow() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
+def _version_tuple(v: str | None) -> tuple:
+    if not v: return tuple()
+    parts = []
+    for p in str(v).split("."):
+        try: parts.append(int(p))
+        except: parts.append(p)
+    return tuple(parts)
+
+@callback
+def _done_by_versions(st) -> bool:
+    """Treat as done if installed_version >= latest_version and not in_progress."""
+    if not st: return False
+    in_prog = st.attributes.get("in_progress", False)
+    if in_prog: return False
+    installed = _version_tuple(st.attributes.get("installed_version"))
+    latest = _version_tuple(st.attributes.get("latest_version"))
+    if not latest: return False
+    if not installed: return False
+    return installed >= latest
+
+
 async def _wait_update_complete(hass: HomeAssistant, ent: str, timeout: timedelta) -> Tuple[bool, str | None]:
     done: asyncio.Future = asyncio.get_event_loop().create_future()
 
@@ -223,10 +246,10 @@ async def _wait_update_complete(hass: HomeAssistant, ent: str, timeout: timedelt
     def _ok() -> Tuple[bool, str | None]:
         st = hass.states.get(ent)
         if st is None: return False, "entity_disappeared"
-        in_prog = st.attributes.get("in_progress")
         if st.state == "off": return True, None
-        if in_prog in (False, None) and st.state != "on":
-            return True, f"final_state={st.state}, in_progress={in_prog}"
+        if _done_by_versions(st):
+            return True, "versions_reached"
+        # Still considered running
         return False, None
 
     ok, reason = _ok()
