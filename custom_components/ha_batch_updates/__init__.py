@@ -15,16 +15,16 @@ _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "ha_batch_updates"
 
-# Serve files in <integration>/panel under this URL prefix:
+# Static mount that serves files in <integration>/panel
 STATIC_URL = "/ha-batch-updates-static"
 
 # Your panel JS module (served from STATIC_URL)
 PANEL_JS_URL = f"{STATIC_URL}/panel/batch-updates.js"
 
-# Sidebar path users click
+# Sidebar URL path
 SIDEBAR_URL_PATH = "batch-updates"
 
-# In-memory log
+# In-memory log store key
 LOG_KEY = f"{DOMAIN}_log"
 
 
@@ -48,7 +48,7 @@ async def _ensure_static_and_resources(hass: HomeAssistant) -> None:
     except Exception as e:  # noqa: BLE001
         _LOGGER.exception("Failed to register static path: %s", e)
 
-    # Preload panel JS (helps some builds)
+    # Preload panel JS (optional)
     try:
         add_extra_js_url(hass, PANEL_JS_URL)
         _LOGGER.debug("Added panel JS: %s", PANEL_JS_URL)
@@ -59,9 +59,9 @@ async def _ensure_static_and_resources(hass: HomeAssistant) -> None:
 async def _register_sidebar_panel(hass: HomeAssistant) -> None:
     """
     Create/replace the sidebar panel using panel_custom.
-    We load our JS in an iframe, and the JS mounts the <batch-updates-panel>.
+    NOTE: module_url MUST be a top-level arg (not only inside config).
     """
-    # Remove existing, if any (ignore errors)
+    # Remove existing, if present
     try:
         await panel_custom.async_remove_panel(hass, SIDEBAR_URL_PATH)
     except Exception:
@@ -71,16 +71,16 @@ async def _register_sidebar_panel(hass: HomeAssistant) -> None:
         await panel_custom.async_register_panel(
             hass=hass,
             frontend_url_path=SIDEBAR_URL_PATH,
-            webcomponent_name="ha-panel-custom",  # stock custom panel container
+            webcomponent_name="ha-panel-custom",  # HA's generic custom panel container
             sidebar_title="Batch Updates",
             sidebar_icon="mdi:update",
+            module_url=PANEL_JS_URL,              # <- REQUIRED top-level arg
+            require_admin=False,
+            # Optional config passed to ha-panel-custom:
             config={
-                # Tell the container to load our module inside an iframe
-                "module_url": PANEL_JS_URL,
                 "embed_iframe": True,
                 "trust_external": False,
             },
-            require_admin=False,
         )
         _LOGGER.debug("Sidebar panel registered at /%s", SIDEBAR_URL_PATH)
     except Exception as e:  # noqa: BLE001
@@ -146,8 +146,7 @@ def _register_services(hass: HomeAssistant) -> None:
                         "entity_id": ent,
                         "friendly_name": name,
                         "result": "failed",
-                        "reason": str(e),
-                    }
+                        "reason": str(e)},
                 )
 
         if reboot_host:
@@ -175,7 +174,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
-    """Config entry setup (delegates to the same initialization)."""
+    """Config entry setup."""
     hass.data.setdefault(LOG_KEY, [])
     await _ensure_static_and_resources(hass)
     _register_ws(hass)
