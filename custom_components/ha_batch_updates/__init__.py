@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.components import websocket_api
-from homeassistant.components.frontend import async_register_built_in_panel  # ← use helper
+from homeassistant.components.frontend import async_register_built_in_panel
 import voluptuous as vol
 
 # Newer HA has StaticPathConfig + async register API
