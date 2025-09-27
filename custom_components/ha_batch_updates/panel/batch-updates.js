@@ -1,14 +1,14 @@
 // Batch Updates panel – iframe-aware, WS/REST client
-// - Native <button> controls
-// - Status bar during run
-// - Log shows LOCAL time (UTC in tooltip)
-// - Hides entity_id next to names
-// - Icons for items (fallback to update.svg)
-// - NEW: Per-item "i" button opens a modal with changelog + version (tries release_summary/release_notes, or GitHub API via release_url)
+// - Selection + "Back up before each update"
+// - Status bar during run; green bar + "Reboot now" after finish (no auto reboot)
+// - Live per-item progress (spinner when in_progress)
+// - Auto-refreshing log while running (and at start/finish)
+// - Changelog modal per item ("i"), tries entity notes or GitHub release API
+// - Uses entity_picture; falls back to ./update.svg at 28×28
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
-/* ---------------- Helpers: get a HA connection or a thin client ---------------- */
+/* ---------------- HA client detection (WS preferred, REST fallback) ---------------- */
 async function getHAClient(timeoutMs = 15000) {
   const start = Date.now();
 
@@ -27,7 +27,7 @@ async function getHAClient(timeoutMs = 15000) {
   }
 
   while (Date.now() - start < timeoutMs) {
-    let client =
+    const client =
       (await tryGetConn(window)) ||
       (await tryGetConn(window.parent)) ||
       (await tryGetConn(window.top));
@@ -43,32 +43,26 @@ async function getHAClient(timeoutMs = 15000) {
     window?.top?.hass?.auth?.data?.access_token ||
     null;
 
-  if (!token) {
-    throw new Error("No hassConnection in iframe and no auth token found for REST fallback");
-  }
+  if (!token) throw new Error("No hassConnection in iframe and no auth token found for REST fallback");
 
   console.warn("[Batch Updates] using REST fallback (no websocket)");
   const rest = {
     mode: "rest",
     token,
     async getStates() {
-      const res = await fetch("/api/states", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await fetch("/api/states", { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) throw new Error(`REST /api/states failed: ${res.status}`);
       return await res.json();
     },
     async getLog(limit = 100) {
-      return { entries: [] }; // no REST endpoint for our custom log
+      // No REST endpoint for our custom log; return last cached (handled in UI)
+      return { entries: [] };
     },
     async clearLog() { return { ok: true }; },
     async callService(domain, service, service_data) {
       const res = await fetch(`/api/services/${domain}/${service}`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify(service_data || {}),
       });
       if (!res.ok) throw new Error(`REST call_service ${domain}.${service} failed: ${res.status}`);
@@ -110,7 +104,7 @@ function fmtLocal(tsIso) {
   } catch { return tsIso; }
 }
 
-/* ---------------- Small helpers for icons ---------------- */
+/* ---------------- Icon helpers ---------------- */
 function safeEntityPicture(url) {
   if (!url) return null;
   try {
@@ -118,7 +112,6 @@ function safeEntityPicture(url) {
     return `/${url.replace(/^\/+/, "")}`;
   } catch { return null; }
 }
-
 // Use entity picture if available, otherwise packaged update.svg
 function addonIcon(stateObj) {
   const pic = safeEntityPicture(stateObj?.attributes?.entity_picture);
@@ -129,6 +122,7 @@ function addonIcon(stateObj) {
 /* ---------------- Changelog resolver ---------------- */
 async function fetchGitHubReleaseBody(releaseUrl) {
   try {
+    // Expect https://github.com/owner/repo/releases/tag/v1.2.3 or /latest
     const u = new URL(releaseUrl, location.origin);
     if (u.hostname !== "github.com") return null;
     const parts = u.pathname.split("/").filter(Boolean);
@@ -164,6 +158,7 @@ async function buildChangelogHTML(stateObj) {
   const releaseSummary = attr.release_summary || attr.release_notes || "";
   const releaseUrl = attr.release_url || attr.release_url_template || "";
 
+  // Prefer entity-provided summary/notes
   if (releaseSummary) {
     return `
       <h2>${title}</h2>
@@ -173,6 +168,7 @@ async function buildChangelogHTML(stateObj) {
     `;
   }
 
+  // Try GitHub API if URL is a GH release
   if (releaseUrl && /github\.com\/.+\/releases\//i.test(releaseUrl)) {
     const gh = await fetchGitHubReleaseBody(releaseUrl);
     if (gh && (gh.body || gh.name || gh.tag)) {
@@ -186,6 +182,7 @@ async function buildChangelogHTML(stateObj) {
     }
   }
 
+  // Fallback: just show versions + link if available
   return `
     <h2>${title}</h2>
     <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
@@ -208,13 +205,13 @@ class BatchUpdatesPanel extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._states = {};
     this._selected = new Set();
-    this._reboot = false;
     this._backup = true;
     this._log = [];
     this._unsub = null;
     this._client = null;
     this._running = false;
     this._runWatchTimer = null;
+    this._justFinished = false;
   }
 
   connectedCallback() { this.render(); this._init(); }
@@ -226,18 +223,22 @@ class BatchUpdatesPanel extends HTMLElement {
   async _init() {
     try {
       this._client = await getHAClient(20000);
+
       if (this._client.mode === "ws") {
         const conn = this._client.conn;
         const resp = await conn.sendMessagePromise({ type: "get_states" });
         this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
         await this._loadLogWS();
         this.render();
+
+        // Live state changes (to reflect in_progress and completion)
         this._unsub = await conn.subscribeMessage(
           (evt) => {
             const ent = evt?.event?.data?.entity_id;
             if (ent && ent.startsWith("update.")) {
-              conn.sendMessagePromise({ type: "get_states" }).then((all) => {
+              conn.sendMessagePromise({ type: "get_states" }).then(async (all) => {
                 this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
+                if (this._running) await this._loadLogWS(); // pull latest log during runs
                 this.render();
               });
             }
@@ -245,7 +246,12 @@ class BatchUpdatesPanel extends HTMLElement {
           { type: "subscribe_events", event_type: "state_changed" }
         );
       } else {
-        await this._loadOnceREST();
+        // REST one-shot
+        const resp = await this._client.getStates();
+        this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
+        const res = await this._client.getLog(100);
+        this._log = res.entries || [];
+        this.render();
       }
     } catch (e) {
       console.error("[Batch Updates] initialization error:", e);
@@ -264,16 +270,7 @@ class BatchUpdatesPanel extends HTMLElement {
       this._log = res.entries || [];
     } catch (e) {
       console.warn("[Batch Updates] WS log fetch failed:", e);
-      this._log = [];
     }
-  }
-
-  async _loadOnceREST() {
-    const resp = await this._client.getStates();
-    this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
-    const res = await this._client.getLog(100);
-    this._log = res.entries || [];
-    this.render();
   }
 
   async _clearLog() {
@@ -305,21 +302,12 @@ class BatchUpdatesPanel extends HTMLElement {
   _selectAll() { this._selected = new Set(this._updatesList().map((s) => s.entity_id)); this.render(); }
   _selectNone() { this._selected.clear(); this.render(); }
 
-  _anySelectedInProgress() {
-    const ids = Array.from(this._selected);
-    for (const id of ids) {
-      const st = this._states[id];
-      if (!st) continue;
-      if (st.attributes?.in_progress === true) return true;
-    }
-    return false;
-  }
   _allSelectedFinishedOrIdle() {
-    const ids = Array.from(this._selected);
-    for (const id of ids) {
+    for (const id of Array.from(this._selected)) {
       const st = this._states[id];
       if (!st) continue;
       if (st.attributes?.in_progress === true) return false;
+      if (st.state === "on") return false; // still pending/on
     }
     return true;
   }
@@ -331,16 +319,19 @@ class BatchUpdatesPanel extends HTMLElement {
         if (this._client.mode === "ws") {
           const all = await this._client.conn.sendMessagePromise({ type: "get_states" });
           this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
+          await this._loadLogWS(); // <— auto-refresh log while running
         } else {
           const all = await this._client.getStates();
           this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
         }
         this.render();
+
         if (this._allSelectedFinishedOrIdle()) {
           this._running = false;
+          this._justFinished = true; // show green bar with Reboot button
           clearInterval(this._runWatchTimer);
           this._runWatchTimer = null;
-          this._toast("Batch finished. Check the log for details.");
+          if (this._client.mode === "ws") await this._loadLogWS(); // final log refresh
           this.render();
         }
       } catch (e) {
@@ -352,6 +343,7 @@ class BatchUpdatesPanel extends HTMLElement {
   async _run() {
     if (this._selected.size === 0) { alert("Select at least one update."); return; }
     this._running = true;
+    this._justFinished = false;
     this.render();
 
     try {
@@ -362,24 +354,38 @@ class BatchUpdatesPanel extends HTMLElement {
           service: "run",
           service_data: {
             entities: Array.from(this._selected),
-            reboot_host: this._reboot,
             backup: this._backup,
           },
         });
+        await this._loadLogWS(); // immediate log refresh on start
       } else {
         await this._client.callService("ha_batch_updates", "run", {
           entities: Array.from(this._selected),
-          reboot_host: this._reboot,
           backup: this._backup,
         });
       }
-      this._toast("Batch started…");
       this._startRunWatcher();
     } catch (e) {
       this._running = false;
       this._toast(`Error starting batch: ${String(e)}`);
       console.error(e);
       this.render();
+    }
+  }
+
+  async _rebootNow() {
+    try {
+      if (this._client.mode === "ws") {
+        await this._client.conn.sendMessagePromise({
+          type: "call_service", domain: "ha_batch_updates", service: "reboot_now", service_data: {}
+        });
+      } else {
+        await this._client.callService("ha_batch_updates", "reboot_now", {});
+      }
+      this._toast("Reboot triggered.");
+    } catch (e) {
+      console.error("Reboot failed:", e);
+      this._toast("Reboot failed: " + e);
     }
   }
 
@@ -412,7 +418,6 @@ class BatchUpdatesPanel extends HTMLElement {
     const verTo = s.attributes.latest_version || "";
     const verFrom = s.attributes.installed_version || "";
     const inprog = s.attributes.in_progress === true;
-
     const avatar = addonIcon(s);
 
     return `
@@ -454,7 +459,7 @@ class BatchUpdatesPanel extends HTMLElement {
   _toast(msg) {
     const sb = this.shadowRoot.querySelector(".toast");
     if (!sb) return;
-    sb.textContent = msg;
+    sb.innerHTML = msg;
     sb.classList.add("show");
     setTimeout(() => sb.classList.remove("show"), 2500);
   }
@@ -463,14 +468,23 @@ class BatchUpdatesPanel extends HTMLElement {
     const list = this._updatesList();
     const count = list.length;
     const disabled = this._running;
+    const showDoneBar = this._justFinished && !this._running;
+
     const html = `
       <ha-card header="Batch Updates">
         ${this._running ? `
           <div class="statusbar" role="status" aria-live="polite">
             <span class="spinner" aria-hidden="true"></span>
             <strong>Updating…</strong>
-            <span class="muted">Batch is running; controls are disabled.</span>
-            <button class="btn btn-ghost close-status" aria-label="Hide status">×</button>
+            <span class="muted">Live log will refresh automatically.</span>
+          </div>
+        ` : ""}
+
+        ${showDoneBar ? `
+          <div class="statusbar done" role="status" aria-live="polite">
+            <strong>Batch complete.</strong>
+            <span class="muted">Review the log below.</span>
+            <button class="btn btn-raised small" id="rebootNow">Reboot now</button>
           </div>
         ` : ""}
 
@@ -483,10 +497,6 @@ class BatchUpdatesPanel extends HTMLElement {
             <label class="opt">
               <input id="backup" type="checkbox" ${this._backup ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="Back up before each update">
               Back up before each update
-            </label>
-            <label class="opt">
-              <input id="reboot" type="checkbox" ${this._reboot ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="Reboot host at end">
-              Reboot host at end
             </label>
             <button id="run" class="btn btn-raised" ${disabled ? "disabled" : ""} aria-label="Run updates now">Update now</button>
           </div>
@@ -541,8 +551,9 @@ class BatchUpdatesPanel extends HTMLElement {
           display:flex;align-items:center;gap:10px;padding:10px 14px;
           background:var(--info-color, #0b74de);color:#fff;border-top-left-radius:12px;border-top-right-radius:12px
         }
+        .statusbar.done{background:var(--success-color,#0f9d58)}
         .statusbar .muted{opacity:.9}
-        .close-status{margin-left:auto}
+        .btn.small{padding:6px 10px;border-radius:10px}
 
         .spinner{
           display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.6);
@@ -592,18 +603,19 @@ class BatchUpdatesPanel extends HTMLElement {
         .left{display:flex;align-items:center;gap:10px;min-width:0}
         .avatar{
           width:28px;height:28px;border-radius:6px;flex:0 0 28px;object-fit:cover;
+          background:var(--divider-color, #e0e0e0);display:block;
           box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)
         }
-        /* fix for SVG scaling */
+        /* Fix SVG scaling + visual consistency */
         .avatar[src$=".svg"],
         .avatar[src^="data:image/svg"] {
-          width:28px !important;
-          height:28px !important;
           object-fit:contain;
+          padding:2px;
+          background:#0b74de;
+          border-radius:6px;
         }
-
         .name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .ver{opacity:.9;white-space:nowrap}
+        .ver{opacity:.9;white-space:nowrap;display:flex;align-items:center;gap:6px}
 
         .log{padding:0 16px 16px}
         .logbar{display:flex;align-items:center;margin:8px 0}
@@ -647,38 +659,36 @@ class BatchUpdatesPanel extends HTMLElement {
     const root = this.shadowRoot;
     const cs = (id) => root.getElementById(id);
 
+    // Modal close buttons
     const closeBtn = root.getElementById("modal-close");
     const closeBtn1 = root.getElementById("modal-close-1");
     const modal = root.getElementById("modal");
     if (closeBtn) closeBtn.onclick = () => modal.classList.remove("open");
     if (closeBtn1) closeBtn1.onclick = () => modal.classList.remove("open");
 
-    const statusClose = root.querySelector(".close-status");
-    if (statusClose) statusClose.onclick = () => {
-      this._running = false;
-      if (this._runWatchTimer) { clearInterval(this._runWatchTimer); this._runWatchTimer = null; }
-      this.render();
-    };
-
+    // Actions
     if (cs("all")) cs("all").onclick = () => this._selectAll();
     if (cs("none")) cs("none").onclick = () => this._selectNone();
     if (cs("run")) cs("run").onclick = () => this._run();
 
+    // Backup toggle
+    const bk = cs("backup"); if (bk) bk.onchange = (e) => { this._backup = e.target.checked; };
+
+    // Reboot-now button (only visible when done)
+    const rb = cs("rebootNow"); if (rb) rb.onclick = () => this._rebootNow();
+
+    // Checkboxes in rows
     root.querySelectorAll('input[type="checkbox"][data-ent]').forEach((cb) => {
       cb.addEventListener("change", (e) => this._togglePick(e));
     });
-    const rb = cs("reboot"); if (rb) rb.onchange = (e) => { this._reboot = e.target.checked; };
-    const bk = cs("backup"); if (bk) bk.onchange = (e) => { this._backup = e.target.checked; };
 
+    // Log buttons
     const refresh = cs("refreshLog");
     const clear = cs("clearLog");
-    if (refresh) refresh.onclick = async () => {
-      if (this._client.mode === "ws") { await this._loadLogWS(); }
-      else { await this._loadOnceREST(); }
-      this.render();
-    };
+    if (refresh) refresh.onclick = async () => { if (this._client.mode === "ws") { await this._loadLogWS(); this.render(); } };
     if (clear) clear.onclick = async () => { if (confirm("Clear log?")) { await this._clearLog(); } };
 
+    // Wire "i" info buttons
     root.querySelectorAll('button[data-info]').forEach(btn => {
       btn.onclick = () => this._showInfo(btn.dataset.info);
     });
@@ -687,6 +697,7 @@ class BatchUpdatesPanel extends HTMLElement {
 
 customElements.define("batch-updates-panel", BatchUpdatesPanel);
 
+// For iframe, mount on DOM ready
 if (document.readyState === "complete" || document.readyState === "interactive") {
   setTimeout(() => document.body.appendChild(document.createElement("batch-updates-panel")), 0);
 } else {
