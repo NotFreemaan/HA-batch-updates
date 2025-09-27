@@ -1,23 +1,17 @@
-// Batch Updates panel – recommended icon strategy:
-// 1) entity_picture (if provided by entity)
-// 2) /local/ha-batch-updates/update.svg  (user override, optional)
-// 3) /ha-batch-updates-static/panel/update.svg  (bundled with integration)
-// 4) embedded data-URI fallback (guaranteed no white boxes)
+// Batch Updates panel – iframe-aware, WS/REST client
+// - Native <button> controls
+// - Status bar during run
+// - Log shows LOCAL time (UTC in tooltip)
+// - Hides entity_id next to names
+// - Icons for items
+// - NEW: Per-item "i" button opens a modal with changelog + version (tries release_summary/release_notes, or GitHub API via release_url)
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
-/* -------- Embedded fallback icon (blue badge + white update glyph) -------- */
-const EMBED_FALLBACK_ICON =
-  'data:image/svg+xml;charset=UTF-8,' +
-  encodeURIComponent(`
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true" role="img">
-  <circle cx="12" cy="12" r="10" fill="#0B74DE"/>
-  <path fill="#FFFFFF" d="M21,10.12H14.22L16.96,7.3C14.23,4.6 9.81,4.5 7.08,7.2C4.35,9.91 4.35,14.28 7.08,17C9.81,19.7 14.23,19.7 16.96,17C18.32,15.65 19,14.08 19,12.1H21C21,14.08 20.12,16.65 18.36,18.39C14.85,21.87 9.15,21.87 5.64,18.39C2.14,14.92 2.11,9.28 5.62,5.81C9.13,2.34 14.76,2.34 18.27,5.81L21,3V10.12M12.5,8V12.25L16,14.33L15.28,15.54L11,13V8H12.5Z"/>
-</svg>`);
-
-/* -------- HA client (WS preferred, REST fallback) -------- */
+/* ---------------- Helpers: get a HA connection or a thin client ---------------- */
 async function getHAClient(timeoutMs = 15000) {
   const start = Date.now();
+
   async function tryGetConn(host) {
     try {
       if (!host) return null;
@@ -28,144 +22,193 @@ async function getHAClient(timeoutMs = 15000) {
       const hass = host.hass || host.__hass;
       const conn = hass?.connection || hass?.conn;
       if (conn) return { mode: "ws", conn, hass: hass || null };
-    } catch {}
+    } catch (_) {}
     return null;
   }
+
   while (Date.now() - start < timeoutMs) {
-    const client =
+    let client =
       (await tryGetConn(window)) ||
       (await tryGetConn(window.parent)) ||
       (await tryGetConn(window.top));
-    if (client) return client;
+    if (client) {
+      console.info("[Batch Updates] got WebSocket connection");
+      return client;
+    }
     await new Promise((r) => setTimeout(r, 200));
   }
+
   const token =
     window?.parent?.hass?.auth?.data?.access_token ||
     window?.top?.hass?.auth?.data?.access_token ||
     null;
-  if (!token) throw new Error("No hassConnection and no auth token for REST fallback");
+
+  if (!token) {
+    throw new Error("No hassConnection in iframe and no auth token found for REST fallback");
+  }
+
+  console.warn("[Batch Updates] using REST fallback (no websocket)");
   const rest = {
     mode: "rest",
     token,
     async getStates() {
-      const res = await fetch("/api/states", { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch("/api/states", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       if (!res.ok) throw new Error(`REST /api/states failed: ${res.status}`);
       return await res.json();
     },
-    async getLog() { return { entries: [] }; },
+    async getLog(limit = 100) {
+      return { entries: [] }; // no REST endpoint for our custom log
+    },
     async clearLog() { return { ok: true }; },
     async callService(domain, service, service_data) {
       const res = await fetch(`/api/services/${domain}/${service}`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(service_data || {}),
       });
       if (!res.ok) throw new Error(`REST call_service ${domain}.${service} failed: ${res.status}`);
       return await res.json();
     },
-    subscribeStates() { return () => {}; },
+    subscribeStates(handler) {
+      console.warn("[Batch Updates] REST mode: live updates disabled");
+      return () => {};
+    },
   };
   return rest;
 }
 
-/* -------- Time utils (localize log timestamps) -------- */
+/* ---------------- Time formatting (LOCAL) ---------------- */
 function getTZ() {
-  return (
+  const tz =
     window?.parent?.hass?.config?.time_zone ||
     window?.top?.hass?.config?.time_zone ||
-    Intl.DateTimeFormat().resolvedOptions().timeZone
-  );
+    Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return tz;
 }
 function fmtLocal(tsIso) {
   if (!tsIso) return "";
   try {
     const tz = getTZ();
     const d = new Date(tsIso);
-    return new Intl.DateTimeFormat(undefined, {
-      timeZone: tz, year: "numeric", month: "short", day: "2-digit",
-      hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true, timeZoneName: "short",
-    }).format(d);
+    const fmt = new Intl.DateTimeFormat(undefined, {
+      timeZone: tz,
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+      timeZoneName: "short",
+    });
+    return fmt.format(d);
   } catch { return tsIso; }
 }
 
-/* -------- Icon resolution (priority chain) -------- */
-function normalizeUrl(u) {
-  if (!u) return null;
-  if (u.startsWith("http://") || u.startsWith("https://") || u.startsWith("/")) return u;
-  return `/${u.replace(/^\/+/, "")}`;
+/* ---------------- Small helpers for icons/avatars ---------------- */
+function safeEntityPicture(url) {
+  if (!url) return null;
+  try {
+    if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")) return url;
+    return `/${url.replace(/^\/+/, "")}`;
+  } catch { return null; }
 }
-function userOverrideIcon() {
-  // User can place a file at /config/www/ha-batch-updates/update.svg
-  // which is served at /local/ha-batch-updates/update.svg
-  return "/local/ha-batch-updates/update.svg";
-}
-function bundledIcon() {
-  // Bundled with the integration (served by __init__.py static path)
-  return "/ha-batch-updates-static/panel/update.svg";
-}
-function pickIcon(entityPicture) {
-  return normalizeUrl(entityPicture) || userOverrideIcon() || bundledIcon();
+function fallbackAvatarSVG(label = "") {
+  const ch = (label || "?").trim().charAt(0).toUpperCase() || "?";
+  const bg = "#607D8B", fg = "#FFFFFF";
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28" role="img" aria-label="${ch}">
+      <rect width="28" height="28" rx="6" fill="${bg}"/>
+      <text x="50%" y="58%" text-anchor="middle" font-size="14" font-family="Inter,system-ui,Segoe UI,Roboto" fill="${fg}" font-weight="700">${ch}</text>
+    </svg>`;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
-/* -------- Changelog helpers -------- */
+/* ---------------- Changelog resolver ---------------- */
 async function fetchGitHubReleaseBody(releaseUrl) {
   try {
+    // Expect forms like https://github.com/owner/repo/releases/tag/v1.2.3 or /latest
     const u = new URL(releaseUrl, location.origin);
     if (u.hostname !== "github.com") return null;
-    const parts = u.pathname.split("/").filter(Boolean);
+    const parts = u.pathname.split("/").filter(Boolean); // ["owner","repo","releases","tag","v1.2.3"]
     const owner = parts[0], repo = parts[1];
     if (parts[2] !== "releases") return null;
+
     let apiUrl;
-    if (parts[3] === "tag" && parts[4]) apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(parts[4])}`;
-    else if (parts[3] === "latest") apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/latest`;
-    else return null;
+    if (parts[3] === "tag" && parts[4]) {
+      apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(parts[4])}`;
+    } else if (parts[3] === "latest") {
+      apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/latest`;
+    } else {
+      return null;
+    }
+
     const res = await fetch(apiUrl, { headers: { "Accept": "application/vnd.github+json" } });
     if (!res.ok) return null;
     const data = await res.json();
-    return { body: data.body || "", tag: data.tag_name || "", name: data.name || "" };
-  } catch { return null; }
+    const body = data.body || "";
+    const tag = data.tag_name || "";
+    const name = data.name || "";
+    return { body, tag, name };
+  } catch {
+    return null;
+  }
 }
-function escapeHTML(str) {
-  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
-    .replace(/"/g,"&quot;").replace(/'/g,"&#039;");
-}
+
 async function buildChangelogHTML(stateObj) {
   const attr = stateObj?.attributes || {};
   const title = attr.title || attr.friendly_name || stateObj?.entity_id || "Item";
   const from = attr.installed_version || "";
   const to = attr.latest_version || "";
-  const summary = attr.release_summary || attr.release_notes || "";
+  const releaseSummary = attr.release_summary || attr.release_notes || "";
   const releaseUrl = attr.release_url || attr.release_url_template || "";
 
-  if (summary) {
+  // Prefer entity-provided summary/notes
+  if (releaseSummary) {
     return `
-      <h2>${escapeHTML(title)}</h2>
-      <p class="vers">${from ? `${escapeHTML(from)} &rarr; ` : ""}${escapeHTML(to || "")}</p>
-      <div class="md">${escapeHTML(summary)}</div>
+      <h2>${title}</h2>
+      <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
+      <div class="md">${escapeHTML(releaseSummary)}</div>
       ${releaseUrl ? `<p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
     `;
   }
+
+  // Try GitHub API if URL is a GH release
   if (releaseUrl && /github\.com\/.+\/releases\//i.test(releaseUrl)) {
     const gh = await fetchGitHubReleaseBody(releaseUrl);
     if (gh && (gh.body || gh.name || gh.tag)) {
       return `
-        <h2>${escapeHTML(title)}</h2>
-        <p class="vers">${from ? `${escapeHTML(from)} &rarr; ` : ""}${escapeHTML(to || "")}</p>
+        <h2>${title}</h2>
+        <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
         ${gh.name || gh.tag ? `<p class="subtitle">${escapeHTML(gh.name || gh.tag)}</p>` : ""}
         <pre class="prewrap">${escapeHTML(gh.body || "No release notes provided.")}</pre>
         <p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open on GitHub</a></p>
       `;
     }
   }
+
+  // Fallback: just show versions + link if available
   return `
-    <h2>${escapeHTML(title)}</h2>
-    <p class="vers">${from ? `${escapeHTML(from)} &rarr; ` : ""}${escapeHTML(to || "")}</p>
+    <h2>${title}</h2>
+    <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
     <p>No changelog text available.</p>
     ${releaseUrl ? `<p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
   `;
 }
 
-/* -------- Web Component -------- */
+function escapeHTML(str) {
+  return String(str)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+/* ---------------- Web Component ---------------- */
 class BatchUpdatesPanel extends HTMLElement {
   constructor() {
     super();
@@ -182,7 +225,10 @@ class BatchUpdatesPanel extends HTMLElement {
   }
 
   connectedCallback() { this.render(); this._init(); }
-  disconnectedCallback() { if (this._unsub) this._unsub(); if (this._runWatchTimer) clearInterval(this._runWatchTimer); }
+  disconnectedCallback() {
+    if (this._unsub) this._unsub();
+    if (this._runWatchTimer) clearInterval(this._runWatchTimer);
+  }
 
   async _init() {
     try {
@@ -228,6 +274,7 @@ class BatchUpdatesPanel extends HTMLElement {
       this._log = [];
     }
   }
+
   async _loadOnceREST() {
     const resp = await this._client.getStates();
     this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
@@ -235,6 +282,7 @@ class BatchUpdatesPanel extends HTMLElement {
     this._log = res.entries || [];
     this.render();
   }
+
   async _clearLog() {
     if (this._client.mode === "ws") {
       await this._client.conn.sendMessagePromise({ type: "ha_batch_updates/clear_log" });
@@ -250,24 +298,39 @@ class BatchUpdatesPanel extends HTMLElement {
     return Object.values(this._states)
       .filter((s) => s.entity_id?.startsWith?.("update.") && s.state === "on")
       .sort((a, b) =>
-        (a.attributes.friendly_name || a.entity_id).localeCompare(b.attributes.friendly_name || b.entity_id)
+        (a.attributes.friendly_name || a.entity_id)
+          .localeCompare(b.attributes.friendly_name || b.entity_id)
       );
   }
 
   _togglePick(e) {
     const ent = e.currentTarget.dataset.ent;
-    if (e.currentTarget.checked) this._selected.add(ent); else this._selected.delete(ent);
+    if (e.currentTarget.checked) this._selected.add(ent);
+    else this._selected.delete(ent);
     this.render();
   }
   _selectAll() { this._selected = new Set(this._updatesList().map((s) => s.entity_id)); this.render(); }
   _selectNone() { this._selected.clear(); this.render(); }
 
+  _anySelectedInProgress() {
+    const ids = Array.from(this._selected);
+    for (const id of ids) {
+      const st = this._states[id];
+      if (!st) continue;
+      if (st.attributes?.in_progress === true) return true;
+    }
+    return false;
+  }
   _allSelectedFinishedOrIdle() {
-    for (const id of Array.from(this._selected)) {
-      if (this._states[id]?.attributes?.in_progress === true) return false;
+    const ids = Array.from(this._selected);
+    for (const id of ids) {
+      const st = this._states[id];
+      if (!st) continue;
+      if (st.attributes?.in_progress === true) return false;
     }
     return true;
   }
+
   _startRunWatcher() {
     if (this._runWatchTimer) clearInterval(this._runWatchTimer);
     this._runWatchTimer = setInterval(async () => {
@@ -287,13 +350,17 @@ class BatchUpdatesPanel extends HTMLElement {
           this._toast("Batch finished. Check the log for details.");
           this.render();
         }
-      } catch (e) { console.warn("[Batch Updates] run watcher error:", e); }
+      } catch (e) {
+        console.warn("[Batch Updates] run watcher error:", e);
+      }
     }, 2000);
   }
 
   async _run() {
     if (this._selected.size === 0) { alert("Select at least one update."); return; }
-    this._running = true; this.render();
+    this._running = true;
+    this.render();
+
     try {
       if (this._client.mode === "ws") {
         await this._client.conn.sendMessagePromise({
@@ -324,15 +391,18 @@ class BatchUpdatesPanel extends HTMLElement {
   }
 
   async _showInfo(entityId) {
-    const s = this._states[entityId]; if (!s) return;
+    const s = this._states[entityId];
+    if (!s) return;
     const modal = this.shadowRoot.getElementById("modal");
     const body = this.shadowRoot.querySelector(".modal-body");
     const footer = this.shadowRoot.querySelector(".modal-footer");
     body.innerHTML = `<div class="loading"><span class="spinner dark"></span> Loading changelog…</div>`;
     modal.classList.add("open");
+
     try {
       const html = await buildChangelogHTML(s);
       body.innerHTML = html;
+      // Add close + open link if exists in attributes
       footer.innerHTML = `
         ${s.attributes?.release_url ? `<a class="btn btn-ghost" href="${s.attributes.release_url}" target="_blank" rel="noreferrer">Open release</a>` : ""}
         <button class="btn btn-raised" id="modal-close-2">Close</button>
@@ -351,24 +421,18 @@ class BatchUpdatesPanel extends HTMLElement {
     const verFrom = s.attributes.installed_version || "";
     const inprog = s.attributes.in_progress === true;
 
-    // icon priority: entity -> /local override -> bundled -> embedded
-    const desired = pickIcon(s.attributes?.entity_picture);
-    const fallback = bundledIcon();
+    const picAttr = safeEntityPicture(s.attributes?.entity_picture);
+    const avatar = picAttr || fallbackAvatarSVG(name);
 
     return `
       <li class="row">
         <label class="left">
-          <img class="avatar"
-               src="${desired}"
-               alt=""
-               loading="lazy"
-               referrerpolicy="no-referrer"
-               onerror="this.onerror=null; this.src='${fallback}'; this.addEventListener('error',()=>{ this.src='${EMBED_FALLBACK_ICON}';});" />
+          <img class="avatar" src="${avatar}" alt="" loading="lazy" referrerpolicy="no-referrer" />
           <input type="checkbox" data-ent="${id}" ${this._selected.has(id) ? "checked" : ""} ${inprog || this._running ? "disabled" : ""}>
-          <span class="name" title="${escapeHTML(name)}">${escapeHTML(name)}</span>
+          <span class="name" title="${name}">${name}</span>
         </label>
         <span class="ver">
-          ${verFrom ? `${escapeHTML(verFrom)} ` : ""}${verTo ? `&rarr; ${escapeHTML(verTo)}` : ""}
+          ${verFrom ? `${verFrom} ` : ""}${verTo ? `&rarr; ${verTo}` : ""}
           ${inprog ? ' <span class="spinner" aria-label="In progress"></span>' : ''}
           <button class="btn btn-chip info" data-info="${id}" title="Show changelog">i</button>
         </span>
@@ -388,10 +452,10 @@ class BatchUpdatesPanel extends HTMLElement {
     else if (result === "started") badge = "warn";
     return `
       <tr title="UTC: ${utc}">
-        <td class="ts">${escapeHTML(local)}</td>
-        <td class="name">${escapeHTML(name)}</td>
-        <td class="res"><span class="badge ${badge}">${escapeHTML(result)}</span></td>
-        <td class="reason">${escapeHTML(reason)}</td>
+        <td class="ts">${local}</td>
+        <td class="name">${name}</td>
+        <td class="res"><span class="badge ${badge}">${result}</span></td>
+        <td class="reason">${reason}</td>
       </tr>
     `;
   }
@@ -421,19 +485,19 @@ class BatchUpdatesPanel extends HTMLElement {
 
         <div class="content ${disabled ? 'is-disabled' : ''}">
           <div class="actions" role="toolbar" aria-label="Batch update controls">
-            <button id="all" class="btn btn-outlined" ${disabled ? "disabled" : ""}>Select all</button>
-            <button id="none" class="btn btn-outlined" ${disabled ? "disabled" : ""}>Clear</button>
+            <button id="all" class="btn btn-outlined" ${disabled ? "disabled" : ""} aria-label="Select all pending updates">Select all</button>
+            <button id="none" class="btn btn-outlined" ${disabled ? "disabled" : ""} aria-label="Clear selection">Clear</button>
             <span class="count-pill" title="Pending updates">${count} pending</span>
             <span class="spacer"></span>
             <label class="opt">
-              <input id="backup" type="checkbox" ${this._backup ? "checked" : ""} ${disabled ? "disabled" : ""}>
+              <input id="backup" type="checkbox" ${this._backup ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="Back up before each update">
               Back up before each update
             </label>
             <label class="opt">
-              <input id="reboot" type="checkbox" ${this._reboot ? "checked" : ""} ${disabled ? "disabled" : ""}>
+              <input id="reboot" type="checkbox" ${this._reboot ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="Reboot host at end">
               Reboot host at end
             </label>
-            <button id="run" class="btn btn-raised" ${disabled ? "disabled" : ""}>Update now</button>
+            <button id="run" class="btn btn-raised" ${disabled ? "disabled" : ""} aria-label="Run updates now">Update now</button>
           </div>
 
           ${count === 0
@@ -445,8 +509,8 @@ class BatchUpdatesPanel extends HTMLElement {
           <div class="logbar">
             <h3>Update log (latest)</h3>
             <span class="spacer"></span>
-            <button id="refreshLog" class="btn btn-ghost">Refresh</button>
-            <button id="clearLog" class="btn btn-ghost">Clear log</button>
+            <button id="refreshLog" class="btn btn-ghost" aria-label="Refresh log">Refresh</button>
+            <button id="clearLog" class="btn btn-ghost" aria-label="Clear log">Clear log</button>
           </div>
           <table>
             <thead><tr><th>Time (local)</th><th>Item</th><th>Result</th><th>Reason / Action</th></tr></thead>
@@ -463,8 +527,12 @@ class BatchUpdatesPanel extends HTMLElement {
               <strong>Changelog</strong>
               <button class="btn btn-ghost" id="modal-close" aria-label="Close">×</button>
             </div>
-            <div class="modal-body"></div>
-            <div class="modal-footer"><button class="btn btn-raised" id="modal-close-1">Close</button></div>
+            <div class="modal-body">
+              <!-- dynamic -->
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-raised" id="modal-close-1">Close</button>
+            </div>
           </div>
         </div>
       </ha-card>
@@ -475,46 +543,79 @@ class BatchUpdatesPanel extends HTMLElement {
         .actions{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
         .opt{display:flex;align-items:center;gap:6px}
         .spacer{flex:1}
+
+        /* Disabled mode */
         .is-disabled{opacity:.7}
         .is-disabled .btn{pointer-events:none}
         .is-disabled input[type="checkbox"]{pointer-events:none}
 
-        .statusbar{display:flex;align-items:center;gap:10px;padding:10px 14px;
-          background:var(--info-color, #0b74de);color:#fff;border-top-left-radius:12px;border-top-right-radius:12px}
-        .statusbar .muted{opacity:.9}.close-status{margin-left:auto}
+        /* Status bar */
+        .statusbar{
+          display:flex;align-items:center;gap:10px;padding:10px 14px;
+          background:var(--info-color, #0b74de);color:#fff;border-top-left-radius:12px;border-top-right-radius:12px
+        }
+        .statusbar .muted{opacity:.9}
+        .close-status{margin-left:auto}
 
-        .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.6);
-          border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
-        .spinner.dark{border-color: rgba(0,0,0,.25); border-top-color: rgba(0,0,0,.65);}
+        /* Spinner */
+        .spinner{
+          display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.6);
+          border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px
+        }
+        .spinner.dark{
+          border-color: rgba(0,0,0,.25);
+          border-top-color: rgba(0,0,0,.65);
+        }
         @keyframes spin{to{transform:rotate(360deg)}}
 
-        .btn{appearance:none;border:0;cursor:pointer;padding:8px 12px;border-radius:12px;font-weight:600;
-          transition:box-shadow .15s, filter .15s;background:var(--card-background-color,#fff);
-          color:var(--primary-text-color,#111); box-shadow:inset 0 0 0 2px var(--divider-color,#c7c7c7)}
+        /* Buttons */
+        .btn{
+          appearance:none;border:0;cursor:pointer;padding:8px 12px;
+          border-radius:12px;font-weight:600;transition:box-shadow .15s, filter .15s;
+          background:var(--card-background-color, #ffffff);color:var(--primary-text-color, #111111);
+          box-shadow:inset 0 0 0 2px var(--divider-color, #c7c7c7);
+        }
         .btn[disabled]{opacity:.6;cursor:not-allowed}
         .btn:hover{filter:brightness(0.98)}
-        .btn:focus{outline:2px solid var(--primary-color,#0b74de);outline-offset:2px}
-        .btn-raised{background:var(--primary-color,#0b74de);color:var(--text-on-primary,#fff);
-          box-shadow:inset 0 0 0 2px rgba(0,0,0,.08); border:1px solid rgba(0,0,0,.08)}
-        .btn-outlined{background:transparent;color:var(--primary-text-color,#111)}
-        .btn-ghost{background:transparent;color:var(--primary-text-color,#111);box-shadow:none;opacity:.9}
-        .btn-chip{padding:4px 8px;border-radius:999px;font-size:.82em;line-height:1.2;margin-left:8px}
+        .btn:focus{outline:2px solid var(--primary-color, #0b74de);outline-offset:2px}
+        .btn-raised{
+          background:var(--primary-color, #0b74de);
+          color:var(--text-on-primary, #ffffff);
+          box-shadow:inset 0 0 0 2px rgba(0,0,0,.08);
+          border:1px solid rgba(0,0,0,.08);
+        }
+        .btn-raised:hover{filter:brightness(1.02)}
+        .btn-outlined{
+          background:transparent;color:var(--primary-text-color, #111111);
+        }
+        .btn-ghost{
+          background:transparent;color:var(--primary-text-color, #111111);
+          box-shadow:none;opacity:.9
+        }
+        .btn-chip{
+          padding:4px 8px;border-radius:999px;font-size:.82em;line-height:1.2;margin-left:8px
+        }
 
-        .count-pill{display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;font-weight:700;font-size:.9em;
-          background: var(--primary-color,#0b74de);color: white;line-height:1.8;}
+        .count-pill{
+          display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;
+          font-weight:700;font-size:.9em;background: var(--primary-color, #0b74de);color: white;line-height:1.8;
+        }
 
         ul{list-style:none;margin:0;padding:0}
-        .row{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--divider-color,#e0e0e0);padding:10px 0}
+        .row{display:flex;align-items:center;justify-content:space-between;
+             border-bottom:1px solid var(--divider-color, #e0e0e0);padding:10px 0}
         .left{display:flex;align-items:center;gap:10px;min-width:0}
-        .avatar{width:28px;height:28px;border-radius:6px;flex:0 0 28px;object-fit:cover;
-          box-shadow:inset 0 0 0 1px rgba(0,0,0,.08); background:#e8eef6}
+        .avatar{
+          width:28px;height:28px;border-radius:6px;flex:0 0 28px;object-fit:cover;
+          box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)
+        }
         .name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .ver{opacity:.9;white-space:nowrap}
 
         .log{padding:0 16px 16px}
         .logbar{display:flex;align-items:center;margin:8px 0}
         table{width:100%;border-collapse:collapse}
-        th,td{padding:8px;border-bottom:1px solid var(--divider-color,#e0e0e0);text-align:left}
+        th,td{padding:8px;border-bottom:1px solid var(--divider-color, #e0e0e0);text-align:left}
         .badge{padding:2px 8px;border-radius:12px;font-size:.85em}
         .badge.ok{background:var(--success-color,#0f9d58);color:white}
         .badge.err{background:var(--error-color,#d93025);color:white}
@@ -522,14 +623,25 @@ class BatchUpdatesPanel extends HTMLElement {
         .badge.neutral{background:#999;color:white}
         .ts{white-space:nowrap}
 
-        .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
-          background:rgba(0,0,0,.85);color:#fff;padding:10px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;}
+        /* Toast */
+        .toast{
+          position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
+          background:rgba(0,0,0,.85);color:#fff;padding:10px 14px;border-radius:10px;
+          opacity:0;pointer-events:none;transition:opacity .2s;
+        }
         .toast.show{opacity:1}
 
-        .modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.4);z-index:9999;padding:20px}
+        /* Modal */
+        .modal{
+          position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+          background:rgba(0,0,0,.4);z-index:9999;padding:20px
+        }
         .modal.open{display:flex}
-        .modal-card{width:min(820px,96vw);max-height:85vh;overflow:auto;border-radius:16px;
-          background:var(--card-background-color,#fff);color:var(--primary-text-color,#111);box-shadow:0 10px 30px rgba(0,0,0,.25)}
+        .modal-card{
+          width:min(820px, 96vw);max-height:85vh;overflow:auto;border-radius:16px;
+          background:var(--card-background-color, #fff);color:var(--primary-text-color, #111);
+          box-shadow:0 10px 30px rgba(0,0,0,.25)
+        }
         .modal-head{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--divider-color,#e0e0e0)}
         .modal-body{padding:16px}
         .modal-footer{padding:14px 16px;border-top:1px solid var(--divider-color,#e0e0e0);display:flex;gap:10px;justify-content:flex-end}
@@ -542,11 +654,13 @@ class BatchUpdatesPanel extends HTMLElement {
     this.shadowRoot.innerHTML = html;
 
     const root = this.shadowRoot;
+    const cs = (id) => root.getElementById(id);
+
+    const closeBtn = root.getElementById("modal-close");
+    const closeBtn1 = root.getElementById("modal-close-1");
     const modal = root.getElementById("modal");
-    const closeA = root.getElementById("modal-close");
-    const closeB = root.getElementById("modal-close-1");
-    if (closeA) closeA.onclick = () => modal.classList.remove("open");
-    if (closeB) closeB.onclick = () => modal.classList.remove("open");
+    if (closeBtn) closeBtn.onclick = () => modal.classList.remove("open");
+    if (closeBtn1) closeBtn1.onclick = () => modal.classList.remove("open");
 
     const statusClose = root.querySelector(".close-status");
     if (statusClose) statusClose.onclick = () => {
@@ -555,7 +669,6 @@ class BatchUpdatesPanel extends HTMLElement {
       this.render();
     };
 
-    const cs = (id) => root.getElementById(id);
     if (cs("all")) cs("all").onclick = () => this._selectAll();
     if (cs("none")) cs("none").onclick = () => this._selectNone();
     if (cs("run")) cs("run").onclick = () => this._run();
@@ -569,12 +682,14 @@ class BatchUpdatesPanel extends HTMLElement {
     const refresh = cs("refreshLog");
     const clear = cs("clearLog");
     if (refresh) refresh.onclick = async () => {
-      if (this._client.mode === "ws") { await this._loadLogWS(); } else { await this._loadOnceREST(); }
+      if (this._client.mode === "ws") { await this._loadLogWS(); }
+      else { await this._loadOnceREST(); }
       this.render();
     };
     if (clear) clear.onclick = async () => { if (confirm("Clear log?")) { await this._clearLog(); } };
 
-    root.querySelectorAll('button[data-info]').forEach((btn) => {
+    // Wire "i" info buttons
+    root.querySelectorAll('button[data-info]').forEach(btn => {
       btn.onclick = () => this._showInfo(btn.dataset.info);
     });
   }
@@ -582,7 +697,7 @@ class BatchUpdatesPanel extends HTMLElement {
 
 customElements.define("batch-updates-panel", BatchUpdatesPanel);
 
-// Mount component on DOM ready
+// For iframe, mount on DOM ready
 if (document.readyState === "complete" || document.readyState === "interactive") {
   setTimeout(() => document.body.appendChild(document.createElement("batch-updates-panel")), 0);
 } else {
