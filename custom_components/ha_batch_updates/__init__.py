@@ -11,7 +11,7 @@ from homeassistant.components import websocket_api
 from homeassistant.components.frontend import async_register_built_in_panel
 import voluptuous as vol
 
-# Newer HA has StaticPathConfig + async register API
+# Static file mounting (compat across HA versions)
 try:
     from homeassistant.components.http import StaticPathConfig
 except Exception:  # noqa: BLE001
@@ -50,10 +50,10 @@ class UpdateLog:
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
-    """Register static files, iframe panel, log, WS, and service."""
+    """Register static files, iframe panel, log, WS, and services."""
     panel_fs_path = hass.config.path(f"custom_components/{DOMAIN}/panel")
 
-    # ---- Serve panel assets (compat across HA versions) ----
+    # ---- Serve panel assets ----
     try:
         if hasattr(hass.http, "async_register_static_paths") and StaticPathConfig is not None:
             await hass.http.async_register_static_paths([StaticPathConfig(STATIC_URL, panel_fs_path)])
@@ -66,18 +66,15 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         _LOGGER.error("Static path registration failed for %s: %s", DOMAIN, e)
         return False
 
-    # ---- Sidebar panel (admin-only) via IFRAME (avoids custom panel loader entirely) ----
+    # ---- Sidebar panel via IFRAME ----
     try:
         async_register_built_in_panel(
             hass,
-            component_name="iframe",  # IMPORTANT: use the iframe panel type
+            component_name="iframe",
             sidebar_title=PANEL_TITLE,
             sidebar_icon=PANEL_ICON,
             frontend_url_path=PANEL_URL_PATH,
-            config={
-                # 'url' is required by the iframe panel
-                "url": f"{STATIC_URL}/batch-updates.html"
-            },
+            config={"url": f"{STATIC_URL}/batch-updates.html"},
             require_admin=True,
         )
         _LOGGER.info("%s iframe panel registered at /%s -> %s/batch-updates.html",
@@ -95,24 +92,22 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     websocket_api.async_register_command(hass, _ws_get_log)
     websocket_api.async_register_command(hass, _ws_clear_log)
 
-    # ---- Batch update service ----
+    # ---- Batch update service (no auto-reboot) ----
     schema = vol.Schema(
         {
             vol.Required("entities"): [str],
-            vol.Optional("reboot_host", default=False): bool,
             vol.Optional("backup", default=True): bool,
         }
     )
 
     async def _service(call: ServiceCall):
         entities: List[str] = call.data["entities"]
-        reboot_host: bool = call.data["reboot_host"]
         backup_flag: bool = call.data["backup"]
         if not entities:
             _LOGGER.warning("No entities provided to %s.run", DOMAIN)
             return
 
-        # Defer HA Core/OS/Supervisor to end (they may restart HA)
+        # Defer HA updates to the end (even though we no longer auto-reboot)
         last = [e for e in entities if e.startswith("update.home_assistant_")]
         first = [e for e in entities if not e.startswith("update.home_assistant_")]
         ordered = first + last
@@ -125,7 +120,6 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
                 "type": "batch_started",
                 "batch_id": batch_id,
                 "count": len(ordered),
-                "reboot_host": reboot_host,
                 "backup": backup_flag,
                 "ts": _utcnow(),
             },
@@ -147,8 +141,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             tgt = st.attributes.get("latest_version")
 
             await _log_item(
-                hass, log, batch_id, ent, "started", "Starting update",
-                extra={"name": name, "from": cur, "to": tgt, "backup": backup_flag}
+                hass, log, batch_id, ent, "started", f"Updating {cur or ''} -> {tgt or ''}"
             )
 
             try:
@@ -172,9 +165,8 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             post = st2.state if st2 else "unknown"
             if post == "off":
                 await _log_item(
-                    hass, log, batch_id, ent, "success", "Updated successfully", extra={"final_state": post}
+                    hass, log, batch_id, ent, "success", "Updated successfully"
                 )
-                _logbook(hass, f"{name} updated successfully.")
             else:
                 in_prog = st2 and st2.attributes.get("in_progress")
                 extra_reason = f"final_state={post}, in_progress={in_prog}"
@@ -182,19 +174,21 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
                 _notify(hass, f"{name}: unclear completion ({extra_reason}). Halting batch.")
                 return
 
-        # Finish: reboot host (HA OS/Supervised) or restart core
-        if reboot_host and _is_supervised(hass):
-            await _log_event(
-                hass, log, {"type": "batch_finishing", "batch_id": batch_id, "action": "host_reboot", "ts": _utcnow()}
-            )
+        # Finish: NO auto restart/reboot; expose manual button via UI
+        await _log_event(
+            hass, log, {"type": "batch_finished", "batch_id": batch_id, "action": "manual_reboot_available", "ts": _utcnow()}
+        )
+        _notify(hass, "Batch complete. You may reboot Home Assistant manually from the panel.")
+
+    async def _reboot_service(call: ServiceCall):
+        """Manual reboot endpoint the panel can call."""
+        if _is_supervised(hass):
             await hass.services.async_call("hassio", "host_reboot", {}, blocking=False)
         else:
-            await _log_event(
-                hass, log, {"type": "batch_finishing", "batch_id": batch_id, "action": "ha_restart", "ts": _utcnow()}
-            )
             await hass.services.async_call("homeassistant", "restart", {}, blocking=False)
 
     hass.services.async_register(DOMAIN, "run", _service, schema=schema)
+    hass.services.async_register(DOMAIN, "reboot_now", _reboot_service)
     return True
 
 
@@ -210,12 +204,6 @@ def _notify(hass: HomeAssistant, msg: str):
     )
 
 
-def _logbook(hass: HomeAssistant, message: str):
-    hass.async_create_task(
-        hass.services.async_call("logbook", "log", {"name": "Batch Updates", "message": message}, blocking=False)
-    )
-
-
 async def _log_event(hass: HomeAssistant, log: UpdateLog, payload: Dict[str, Any]):
     await log.async_append(payload)
     _LOGGER.info("BatchUpdates LOG: %s", payload)
@@ -228,7 +216,6 @@ async def _log_item(
     entity_id: str,
     result: str,
     reason: str,
-    extra: Dict[str, Any] | None = None,
 ):
     st = hass.states.get(entity_id)
     base = {
@@ -240,8 +227,6 @@ async def _log_item(
         "reason": reason,
         "ts": _utcnow(),
     }
-    if extra:
-        base.update(extra)
     await log.async_append(base)
     _LOGGER.info("BatchUpdates LOG: %s", base)
 
@@ -308,16 +293,3 @@ async def _ws_clear_log(hass: HomeAssistant, connection, msg):
     log._entries = []
     await log._store.async_save([])
     connection.send_result(msg["id"], {"ok": True})
-
-
-# -----------------------------
-# Config entry support (optional)
-# -----------------------------
-async def async_setup_entry(hass, entry):
-    """Set up Batch Updates from a config entry (UI)."""
-    return True
-
-
-async def async_unload_entry(hass, entry):
-    """Unload Batch Updates config entry."""
-    return True
