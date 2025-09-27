@@ -76,7 +76,12 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             sidebar_title=PANEL_TITLE,
             sidebar_icon=PANEL_ICON,
             frontend_url_path=PANEL_URL_PATH,
-            config={"embed_iframe": False, "module_url": f"{STATIC_URL}/batch-updates.js"},
+            config={
+                "embed_iframe": False,
+                # Give HA both formats; it will use what it prefers
+                "module_url": f"{STATIC_URL}/batch-updates.js",
+                "html_url": f"{STATIC_URL}/batch-updates.html",
+            },
             require_admin=True,
         )
     except Exception as e:  # noqa: BLE001
