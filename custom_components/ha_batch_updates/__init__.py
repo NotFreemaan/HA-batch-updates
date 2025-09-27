@@ -11,7 +11,6 @@ from homeassistant.components import websocket_api
 from homeassistant.components.frontend import async_register_built_in_panel
 import voluptuous as vol
 
-# Static file mounting (compat across HA versions)
 try:
     from homeassistant.components.http import StaticPathConfig
 except Exception:  # noqa: BLE001
@@ -20,14 +19,14 @@ except Exception:  # noqa: BLE001
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "ha_batch_updates"
-PANEL_URL_PATH = "batch-updates"   # sidebar path: /batch-updates
-STATIC_URL = f"/{DOMAIN}"          # static files served at /ha_batch_updates
+PANEL_URL_PATH = "batch-updates"
+STATIC_URL = f"/{DOMAIN}"
 PANEL_TITLE = "Batch Updates"
 PANEL_ICON = "mdi:playlist-check"
 
 LOG_STORE_VERSION = 1
 LOG_STORE_FILENAME = f"{DOMAIN}_log.json"
-LOG_MAX_ENTRIES = 500  # ring buffer
+LOG_MAX_ENTRIES = 500
 
 
 class UpdateLog:
@@ -50,10 +49,9 @@ class UpdateLog:
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
-    """Register static files, iframe panel, log, WS, and services."""
     panel_fs_path = hass.config.path(f"custom_components/{DOMAIN}/panel")
 
-    # ---- Serve panel assets ----
+    # Serve panel assets
     try:
         if hasattr(hass.http, "async_register_static_paths") and StaticPathConfig is not None:
             await hass.http.async_register_static_paths([StaticPathConfig(STATIC_URL, panel_fs_path)])
@@ -61,12 +59,12 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             hass.http.register_static_path(STATIC_URL, panel_fs_path, cache_headers=True)
         else:
             hass.http.app.router.add_static(STATIC_URL, panel_fs_path, follow_symlinks=True)  # type: ignore[attr-defined]
-        _LOGGER.info("%s static mounted at %s (from %s)", DOMAIN, STATIC_URL, panel_fs_path)
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.error("Static path registration failed for %s: %s", DOMAIN, e)
+        _LOGGER.info("%s static mounted at %s", DOMAIN, STATIC_URL)
+    except Exception as e:
+        _LOGGER.error("Static path registration failed: %s", e)
         return False
 
-    # ---- Sidebar panel via IFRAME ----
+    # Sidebar panel
     try:
         async_register_built_in_panel(
             hass,
@@ -77,25 +75,25 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             config={"url": f"{STATIC_URL}/batch-updates.html"},
             require_admin=True,
         )
-        _LOGGER.info("%s iframe panel registered at /%s -> %s/batch-updates.html",
-                     DOMAIN, PANEL_URL_PATH, STATIC_URL)
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.error("Failed to register iframe sidebar panel: %s", e)
+        _LOGGER.info("%s iframe panel registered", DOMAIN)
+    except Exception as e:
+        _LOGGER.error("Failed to register iframe panel: %s", e)
         return False
 
-    # ---- Persistent log store ----
+    # Log store
     log = UpdateLog(hass)
     await log.async_load()
     hass.data[DOMAIN] = {"log": log}
 
-    # ---- WebSocket API: get/clear log ----
+    # WS API
     websocket_api.async_register_command(hass, _ws_get_log)
     websocket_api.async_register_command(hass, _ws_clear_log)
 
-    # ---- Batch update service (no auto-reboot) ----
+    # Batch run service
     schema = vol.Schema(
         {
             vol.Required("entities"): [str],
+            vol.Optional("reboot_host", default=False): bool,  # no longer used
             vol.Optional("backup", default=True): bool,
         }
     )
@@ -107,24 +105,12 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             _LOGGER.warning("No entities provided to %s.run", DOMAIN)
             return
 
-        # Defer HA updates to the end (even though we no longer auto-reboot)
+        # Reorder: HA updates last
         last = [e for e in entities if e.startswith("update.home_assistant_")]
         first = [e for e in entities if not e.startswith("update.home_assistant_")]
         ordered = first + last
 
         batch_id = _utcnow()
-        await _log_event(
-            hass,
-            log,
-            {
-                "type": "batch_started",
-                "batch_id": batch_id,
-                "count": len(ordered),
-                "backup": backup_flag,
-                "ts": _utcnow(),
-            },
-        )
-
         for ent in ordered:
             st = hass.states.get(ent)
             if not st:
@@ -141,53 +127,45 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             tgt = st.attributes.get("latest_version")
 
             await _log_item(
-                hass, log, batch_id, ent, "started", f"Updating {cur or ''} -> {tgt or ''}"
+                hass, log, batch_id, ent, "started", "Starting update",
+                extra={"name": name, "from": cur, "to": tgt, "backup": backup_flag}
             )
 
             try:
                 await hass.services.async_call(
                     "update", "install", {"entity_id": ent, "backup": backup_flag}, blocking=False
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 await _log_item(hass, log, batch_id, ent, "failed_service_error", str(e))
                 _notify(hass, f"{name}: service error: {e}. Halting batch.")
                 return
 
             ok, reason = await _wait_update_complete(hass, ent, timedelta(minutes=30))
             if not ok:
-                await _log_item(
-                    hass, log, batch_id, ent, "failed_timeout_or_incomplete", reason or "timeout/incomplete"
-                )
-                _notify(hass, f"{name}: did not complete cleanly ({reason or 'timeout'}). Halting batch.")
+                await _log_item(hass, log, batch_id, ent, "failed_timeout_or_incomplete", reason or "timeout")
+                _notify(hass, f"{name}: did not complete cleanly. Halting batch.")
                 return
 
             st2 = hass.states.get(ent)
-            post = st2.state if st2 else "unknown"
-            if post == "off":
-                await _log_item(
-                    hass, log, batch_id, ent, "success", "Updated successfully"
-                )
+            if st2 and st2.state == "off":
+                await _log_item(hass, log, batch_id, ent, "success", "Updated successfully")
+                _logbook(hass, f"{name} updated successfully.")
             else:
-                in_prog = st2 and st2.attributes.get("in_progress")
-                extra_reason = f"final_state={post}, in_progress={in_prog}"
-                await _log_item(hass, log, batch_id, ent, "failed_unclear", extra_reason)
-                _notify(hass, f"{name}: unclear completion ({extra_reason}). Halting batch.")
+                await _log_item(hass, log, batch_id, ent, "failed_unclear", f"final_state={st2.state if st2 else 'unknown'}")
+                _notify(hass, f"{name}: unclear completion. Halting batch.")
                 return
 
-        # Finish: NO auto restart/reboot; expose manual button via UI
-        await _log_event(
-            hass, log, {"type": "batch_finished", "batch_id": batch_id, "action": "manual_reboot_available", "ts": _utcnow()}
-        )
-        _notify(hass, "Batch complete. You may reboot Home Assistant manually from the panel.")
+        _notify(hass, "Batch complete. Use the Reboot now button if required.")
 
+    hass.services.async_register(DOMAIN, "run", _service, schema=schema)
+
+    # Reboot-now service
     async def _reboot_service(call: ServiceCall):
-        """Manual reboot endpoint the panel can call."""
         if _is_supervised(hass):
             await hass.services.async_call("hassio", "host_reboot", {}, blocking=False)
         else:
             await hass.services.async_call("homeassistant", "restart", {}, blocking=False)
 
-    hass.services.async_register(DOMAIN, "run", _service, schema=schema)
     hass.services.async_register(DOMAIN, "reboot_now", _reboot_service)
     return True
 
@@ -204,9 +182,10 @@ def _notify(hass: HomeAssistant, msg: str):
     )
 
 
-async def _log_event(hass: HomeAssistant, log: UpdateLog, payload: Dict[str, Any]):
-    await log.async_append(payload)
-    _LOGGER.info("BatchUpdates LOG: %s", payload)
+def _logbook(hass: HomeAssistant, message: str):
+    hass.async_create_task(
+        hass.services.async_call("logbook", "log", {"name": "Batch Updates", "message": message}, blocking=False)
+    )
 
 
 async def _log_item(
@@ -216,6 +195,7 @@ async def _log_item(
     entity_id: str,
     result: str,
     reason: str,
+    extra: Dict[str, Any] | None = None,
 ):
     st = hass.states.get(entity_id)
     base = {
@@ -227,6 +207,7 @@ async def _log_item(
         "reason": reason,
         "ts": _utcnow(),
     }
+    if extra: base.update(extra)
     await log.async_append(base)
     _LOGGER.info("BatchUpdates LOG: %s", base)
 
@@ -236,35 +217,28 @@ def _utcnow() -> str:
 
 
 async def _wait_update_complete(hass: HomeAssistant, ent: str, timeout: timedelta) -> Tuple[bool, str | None]:
-    """Return (ok, reason). Success if state becomes 'off' or in_progress clears and state != 'on'."""
     done: asyncio.Future = asyncio.get_event_loop().create_future()
 
     @callback
     def _ok() -> Tuple[bool, str | None]:
         st = hass.states.get(ent)
-        if st is None:
-            return False, "entity_disappeared"
+        if st is None: return False, "entity_disappeared"
         in_prog = st.attributes.get("in_progress")
-        if st.state == "off":
-            return True, None
+        if st.state == "off": return True, None
         if in_prog in (False, None) and st.state != "on":
             return True, f"final_state={st.state}, in_progress={in_prog}"
         return False, None
 
     ok, reason = _ok()
-    if ok:
-        return True, reason
+    if ok: return True, reason
 
     @callback
     def _listener(event):
-        if event.data.get("entity_id") != ent:
-            return
+        if event.data.get("entity_id") != ent: return
         ok2, r2 = _ok()
-        if ok2 and not done.done():
-            done.set_result((True, r2))
+        if ok2 and not done.done(): done.set_result((True, r2))
 
     remove = async_track_state_change_event(hass, [ent], _listener)
-
     try:
         res = await asyncio.wait_for(done, timeout.total_seconds())
         return res
@@ -274,9 +248,6 @@ async def _wait_update_complete(hass: HomeAssistant, ent: str, timeout: timedelt
         remove()
 
 
-# -------------------
-# WebSocket endpoints
-# -------------------
 @websocket_api.websocket_command(
     {vol.Required("type"): f"{DOMAIN}/get_log", vol.Optional("limit", default=100): vol.Coerce(int)}
 )
@@ -293,3 +264,11 @@ async def _ws_clear_log(hass: HomeAssistant, connection, msg):
     log._entries = []
     await log._store.async_save([])
     connection.send_result(msg["id"], {"ok": True})
+
+
+async def async_setup_entry(hass, entry):
+    return True
+
+
+async def async_unload_entry(hass, entry):
+    return True
