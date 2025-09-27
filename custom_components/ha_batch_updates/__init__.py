@@ -20,45 +20,36 @@ PANEL_JS_URL = f"{STATIC_URL}/panel/batch-updates.js"
 LOG_KEY = f"{DOMAIN}_log"
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Batch Updates integration."""
-    # Ensure in-memory log store exists
-    hass.data.setdefault(LOG_KEY, [])
-
-    # Serve files from <integration>/panel under /ha-batch-updates-static
+async def _ensure_static_and_panel(hass: HomeAssistant) -> None:
+    """Register static path and inject our panel JS."""
     panel_dir = Path(__file__).parent / "panel"
     panel_dir.mkdir(exist_ok=True)
 
+    # Serve /ha-batch-updates-static/* from <integration>/panel
     try:
         await hass.http.async_register_static_paths(
-            [
-                StaticPathConfig(
-                    url_path=STATIC_URL,
-                    path=str(panel_dir),
-                    cache_headers=False,
-                )
-            ]
+            [StaticPathConfig(url_path=STATIC_URL, path=str(panel_dir), cache_headers=False)]
         )
         _LOGGER.debug("Registered static path: %s -> %s", STATIC_URL, panel_dir)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         _LOGGER.exception("Failed to register static path: %s", e)
 
-    # Load our panel JS globally
+    # Load our panel JS in the frontend
     try:
         add_extra_js_url(hass, PANEL_JS_URL)
         _LOGGER.debug("Added panel JS: %s", PANEL_JS_URL)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         _LOGGER.exception("Failed to add panel JS: %s", e)
 
-    # ---- WebSocket commands: get_log / clear_log
+
+def _register_ws(hass: HomeAssistant) -> None:
+    """Register websocket commands."""
     async def _ws_get_log(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
-        """Return recent log entries."""
         limit = msg.get("limit", 100)
         entries = hass.data.get(LOG_KEY, [])[-limit:]
         await connection.send_result(msg["id"], {"entries": entries})
 
     async def _ws_clear_log(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
-        """Clear log entries."""
         hass.data[LOG_KEY] = []
         await connection.send_result(msg["id"], {"ok": True})
 
@@ -66,7 +57,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     websocket_api.async_register_command(hass, f"{DOMAIN}/clear_log", _ws_clear_log)
     _LOGGER.debug("WebSocket commands registered")
 
-    # ---- Service: ha_batch_updates.run
+
+def _register_services(hass: HomeAssistant) -> None:
+    """Register services."""
     async def async_service_run(call: ServiceCall) -> None:
         entities = call.data.get("entities") or []
         reboot_host = bool(call.data.get("reboot_host"))
@@ -106,7 +99,32 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
         await _log({"type": "batch_finishing", "result": "batch_finishing", "action": "done"})
 
-    hass.services.async_register(DOMAIN, "run", async_service_run)
-    _LOGGER.debug("Service %s.run registered", DOMAIN)
+    # Only register once (avoid duplicates on reload)
+    if not hass.services.has_service(DOMAIN, "run"):
+        hass.services.async_register(DOMAIN, "run", async_service_run)
+        _LOGGER.debug("Service %s.run registered", DOMAIN)
 
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """YAML setup (and shared init)."""
+    hass.data.setdefault(LOG_KEY, [])
+    await _ensure_static_and_panel(hass)
+    _register_ws(hass)
+    _register_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
+    """Config entry setup (delegates to the same initialization)."""
+    # Ensure data and mounts exist even when loaded via config entries
+    hass.data.setdefault(LOG_KEY, [])
+    await _ensure_static_and_panel(hass)
+    _register_ws(hass)
+    _register_services(hass)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry) -> bool:
+    """Unload a config entry. Nothing persistent to unload, so return True."""
+    # We don’t remove static paths or extra JS here; HA restart cleans those.
     return True
