@@ -1,4 +1,6 @@
-// Batch Updates panel – robust mount for various HA loader contracts
+// Batch Updates panel – robust mount for various HA loader contracts (with extra logging)
+
+console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
 class BatchUpdatesPanel extends HTMLElement {
   constructor() {
@@ -12,6 +14,7 @@ class BatchUpdatesPanel extends HTMLElement {
   }
 
   connectedCallback() {
+    console.info("[Batch Updates] connectedCallback");
     this.render();
     this._subscribe();
   }
@@ -20,6 +23,7 @@ class BatchUpdatesPanel extends HTMLElement {
   async _subscribe() {
     try {
       const { conn } = await window.hassConnection; // HA provides this
+      console.info("[Batch Updates] hassConnection ready");
       const resp = await conn.sendMessagePromise({ type: "get_states" });
       this._states = Object.fromEntries(resp.map(s => [s.entity_id, s]));
       await this._loadLog();
@@ -36,7 +40,7 @@ class BatchUpdatesPanel extends HTMLElement {
         }
       }, { type: "subscribe_events", event_type: "state_changed" });
     } catch (e) {
-      // If hassConnection isn't ready, show a friendly message
+      console.error("[Batch Updates] subscribe error:", e);
       this.shadowRoot.innerHTML = `
         <div style="padding:16px">
           <p>Home Assistant connection not ready yet. Try reloading the page.</p>
@@ -220,28 +224,32 @@ class BatchUpdatesPanel extends HTMLElement {
 customElements.define("batch-updates-panel", BatchUpdatesPanel);
 
 /* ---------- Robust mount for multiple HA panel loader contracts ---------- */
-/* 1) Newer contract: window.customPanel = { default: { embed(el) {…} } }   */
 function mountInto(el) {
+  console.info("[Batch Updates] mountInto", el);
   if (!el) el = document.body; // fallback
   if (!el.querySelector("batch-updates-panel")) {
     el.appendChild(document.createElement("batch-updates-panel"));
   }
 }
+
+// Newer contract: window.customPanel = { default: { embed(el) {…} } }
 if (typeof window.customPanel === "object" && window.customPanel?.default?.embed) {
-  // If HA calls this structure, keep it
-  window.customPanel = window.customPanel;
-  window.customPanel.default.embed = (el) => mountInto(el);
+  const old = window.customPanel.default.embed;
+  window.customPanel.default.embed = (el) => { try { old?.(el); } catch (e) {} mountInto(el); };
 } else if (typeof window.customPanel === "function") {
   // Older contract: function(el)
   const oldFn = window.customPanel;
-  window.customPanel = (el) => { try { oldFn(el); } catch (e) {} mountInto(el); };
+  window.customPanel = (el) => { try { oldFn?.(el); } catch (e) {} mountInto(el); };
 } else {
   // If neither is present yet, define a handler HA can call
   window.customPanel = (el) => mountInto(el);
 }
+
 // Also try mounting once DOM is ready (helps in some builds)
 if (document.readyState === "complete" || document.readyState === "interactive") {
   setTimeout(() => mountInto(document.getElementById("view") || document.body), 0);
 } else {
   document.addEventListener("DOMContentLoaded", () => mountInto(document.getElementById("view") || document.body));
 }
+
+console.info("%c[Batch Updates] panel script initialized", "color:#0b74de;font-weight:bold");
