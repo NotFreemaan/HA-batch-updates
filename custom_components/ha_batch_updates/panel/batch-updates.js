@@ -527,7 +527,119 @@ class BatchUpdatesPanel extends HTMLElement {
       </ha-card>
 
       <style>
-        /* CSS omitted for brevity but keep your baseline here */
+        ha-card{max-width:980px;margin:24px auto;display:block}
+        .content{padding:16px}
+        .actions{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+        .opt{display:flex;align-items:center;gap:6px}
+        .spacer{flex:1}
+
+        .is-disabled{opacity:.7}
+        .is-disabled .btn{pointer-events:none}
+        .is-disabled input[type="checkbox"]{pointer-events:none}
+
+        .statusbar{
+          display:flex;align-items:center;gap:10px;padding:10px 14px;
+          background:var(--info-color, #0b74de);color:#fff;border-top-left-radius:12px;border-top-right-radius:12px
+        }
+        .statusbar .muted{opacity:.9}
+        .close-status{margin-left:auto}
+
+        .spinner{
+          display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.6);
+          border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px
+        }
+        .spinner.dark{
+          border-color: rgba(0,0,0,.25);
+          border-top-color: rgba(0,0,0,.65);
+        }
+        @keyframes spin{to{transform:rotate(360deg)}}
+
+        .btn{
+          appearance:none;border:0;cursor:pointer;padding:8px 12px;
+          border-radius:12px;font-weight:600;transition:box-shadow .15s, filter .15s;
+          background:var(--card-background-color, #ffffff);color:var(--primary-text-color, #111111);
+          box-shadow:inset 0 0 0 2px var(--divider-color, #c7c7c7);
+        }
+        .btn[disabled]{opacity:.6;cursor:not-allowed}
+        .btn:hover{filter:brightness(0.98)}
+        .btn:focus{outline:2px solid var(--primary-color, #0b74de);outline-offset:2px}
+        .btn-raised{
+          background:var(--primary-color, #0b74de);
+          color:var(--text-on-primary, #ffffff);
+          box-shadow:inset 0 0 0 2px rgba(0,0,0,.08);
+          border:1px solid rgba(0,0,0,.08);
+        }
+        .btn-raised:hover{filter:brightness(1.02)}
+        .btn-outlined{
+          background:transparent;color:var(--primary-text-color, #111111);
+        }
+        .btn-ghost{
+          background:transparent;color:var(--primary-text-color, #111111);
+          box-shadow:none;opacity:.9
+        }
+        .btn-chip{
+          padding:4px 8px;border-radius:999px;font-size:.82em;line-height:1.2;margin-left:8px
+        }
+
+        .count-pill{
+          display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;
+          font-weight:700;font-size:.9em;background: var(--primary-color, #0b74de);color: white;line-height:1.8;
+        }
+
+        ul{list-style:none;margin:0;padding:0}
+        .row{display:flex;align-items:center;justify-content:space-between;
+             border-bottom:1px solid var(--divider-color, #e0e0e0);padding:10px 0}
+        .left{display:flex;align-items:center;gap:10px;min-width:0}
+        .avatar{
+          width:28px;height:28px;border-radius:6px;flex:0 0 28px;object-fit:cover;
+          box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)
+        }
+        /* fix for SVG scaling */
+        .avatar[src$=".svg"],
+        .avatar[src^="data:image/svg"] {
+          width:28px !important;
+          height:28px !important;
+          object-fit:contain;
+        }
+
+        .name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ver{opacity:.9;white-space:nowrap}
+
+        .log{padding:0 16px 16px}
+        .logbar{display:flex;align-items:center;margin:8px 0}
+        table{width:100%;border-collapse:collapse}
+        th,td{padding:8px;border-bottom:1px solid var(--divider-color, #e0e0e0);text-align:left}
+        .badge{padding:2px 8px;border-radius:12px;font-size:.85em}
+        .badge.ok{background:var(--success-color,#0f9d58);color:white}
+        .badge.err{background:var(--error-color,#d93025);color:white}
+        .badge.warn{background:#e6a700;color:black}
+        .badge.neutral{background:#999;color:white}
+        .ts{white-space:nowrap}
+
+        .toast{
+          position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
+          background:rgba(0,0,0,.85);color:#fff;padding:10px 14px;border-radius:10px;
+          opacity:0;pointer-events:none;transition:opacity .2s;
+        }
+        .toast.show{opacity:1}
+
+        .modal{
+          position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+          background:rgba(0,0,0,.4);z-index:9999;padding:20px
+        }
+        .modal.open{display:flex}
+        .modal-card{
+          width:min(820px, 96vw);max-height:85vh;overflow:auto;border-radius:16px;
+          background:var(--card-background-color, #fff);color:var(--primary-text-color, #111);
+          box-shadow:0 10px 30px rgba(0,0,0,.25)
+        }
+        .modal-head{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--divider-color,#e0e0e0)}
+        .modal-body{padding:16px}
+        .modal-footer{padding:14px 16px;border-top:1px solid var(--divider-color,#e0e0e0);display:flex;gap:10px;justify-content:flex-end}
+        .prewrap{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+        .vers{opacity:.8;margin:.2rem 0 .6rem}
+        .subtitle{opacity:.85;margin:.2rem 0 1rem}
+        .loading{display:flex;align-items:center;gap:8px}
       </style>
     `;
     this.shadowRoot.innerHTML = html;
