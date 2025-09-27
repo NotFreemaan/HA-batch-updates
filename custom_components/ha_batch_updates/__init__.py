@@ -1,8 +1,6 @@
 from __future__ import annotations
 import asyncio
-import json
 import logging
-import os
 from datetime import timedelta, datetime
 from typing import List, Dict, Any, Tuple
 
@@ -22,24 +20,14 @@ except Exception:  # noqa: BLE001
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "ha_batch_updates"
-PANEL_URL_PATH = "batch-updates"
+PANEL_URL_PATH = "batch-updates"  # sidebar path: /batch-updates
+STATIC_URL = f"/{DOMAIN}"         # static files served at /ha_batch_updates
 PANEL_TITLE = "Batch Updates"
 PANEL_ICON = "mdi:playlist-check"
 
 LOG_STORE_VERSION = 1
 LOG_STORE_FILENAME = f"{DOMAIN}_log.json"
 LOG_MAX_ENTRIES = 500  # ring buffer
-
-
-def _read_manifest_version(hass: HomeAssistant) -> str:
-    try:
-        mpath = hass.config.path(f"custom_components/{DOMAIN}/manifest.json")
-        with open(mpath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return str(data.get("version") or "0.0.0")
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.warning("Unable to read manifest version for cache-busting: %s", e)
-        return "0.0.0"
 
 
 class UpdateLog:
@@ -62,26 +50,23 @@ class UpdateLog:
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
-    """YAML setup: register static files, panel, log, WS, and service."""
-    version = _read_manifest_version(hass)
-    # Serve under a versioned mount to bust caches between releases
-    static_mount = f"/{DOMAIN}/v{version}"
+    """Register static files, panel (iframe), log, WS, and service."""
     panel_fs_path = hass.config.path(f"custom_components/{DOMAIN}/panel")
 
     # ---- Serve panel assets (compat across HA versions) ----
     try:
         if hasattr(hass.http, "async_register_static_paths") and StaticPathConfig is not None:
-            await hass.http.async_register_static_paths([StaticPathConfig(static_mount, panel_fs_path)])
+            await hass.http.async_register_static_paths([StaticPathConfig(STATIC_URL, panel_fs_path)])
         elif hasattr(hass.http, "register_static_path"):
-            hass.http.register_static_path(static_mount, panel_fs_path, cache_headers=True)
+            hass.http.register_static_path(STATIC_URL, panel_fs_path, cache_headers=True)
         else:
-            hass.http.app.router.add_static(static_mount, panel_fs_path, follow_symlinks=True)  # type: ignore[attr-defined]
-        _LOGGER.info("%s static mounted at %s (from %s)", DOMAIN, static_mount, panel_fs_path)
+            hass.http.app.router.add_static(STATIC_URL, panel_fs_path, follow_symlinks=True)  # type: ignore[attr-defined]
+        _LOGGER.info("%s static mounted at %s (from %s)", DOMAIN, STATIC_URL, panel_fs_path)
     except Exception as e:  # noqa: BLE001
         _LOGGER.error("Static path registration failed for %s: %s", DOMAIN, e)
         return False
 
-    # ---- Sidebar panel (admin-only) ----
+    # ---- Sidebar panel (admin-only) via iframe (rock-solid across builds) ----
     try:
         async_register_built_in_panel(
             hass,
@@ -90,14 +75,14 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             sidebar_icon=PANEL_ICON,
             frontend_url_path=PANEL_URL_PATH,
             config={
-                "embed_iframe": False,
-                # Provide BOTH formats; different HA builds prefer one or the other
-                "module_url": f"{static_mount}/batch-updates.js",
-                "html_url": f"{static_mount}/batch-updates.html",
+                "embed_iframe": True,
+                # Serve the HTML which loads the JS module (relative path inside)
+                "url_path": f"{STATIC_URL}/batch-updates.html",
             },
             require_admin=True,
         )
-        _LOGGER.info("%s panel registered (module_url/html_url at %s)", DOMAIN, static_mount)
+        _LOGGER.info("%s panel registered at /%s (iframe -> %s/batch-updates.html)",
+                     DOMAIN, PANEL_URL_PATH, STATIC_URL)
     except Exception as e:  # noqa: BLE001
         _LOGGER.error("Failed to register sidebar panel: %s", e)
         return False
