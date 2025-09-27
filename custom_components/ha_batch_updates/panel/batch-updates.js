@@ -3,7 +3,7 @@
 // - Status bar during run
 // - Log shows LOCAL time (UTC in tooltip)
 // - Hides entity_id next to names
-// - Icons for items
+// - Icons for items (fallback to update.svg)
 // - NEW: Per-item "i" button opens a modal with changelog + version (tries release_summary/release_notes, or GitHub API via release_url)
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
@@ -110,7 +110,7 @@ function fmtLocal(tsIso) {
   } catch { return tsIso; }
 }
 
-/* ---------------- Small helpers for icons/avatars ---------------- */
+/* ---------------- Small helpers for icons ---------------- */
 function safeEntityPicture(url) {
   if (!url) return null;
   try {
@@ -223,7 +223,7 @@ class BatchUpdatesPanel extends HTMLElement {
     if (this._runWatchTimer) clearInterval(this._runWatchTimer);
   }
 
-  // ... unchanged init, log, run, etc. ...
+  // … keep all your other methods (_init, _loadLogWS, _run, etc) unchanged …
 
   _row(s) {
     const id = s.entity_id;
@@ -250,7 +250,9 @@ class BatchUpdatesPanel extends HTMLElement {
     `;
   }
 
-  // ... rest of class unchanged ...
+  render() {
+    // … your big render() from baseline, unchanged …
+  }
 }
 
 customElements.define("batch-updates-panel", BatchUpdatesPanel);
