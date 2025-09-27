@@ -1,4 +1,4 @@
-// Batch Updates panel – full version with log width fix and no TZ in time
+// Batch Updates panel – full version with better changelog extraction & same layout
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
@@ -62,7 +62,6 @@ function getTZ() {
          Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 function fmtLocal(tsIso) {
-  // Show only local date + time, no timezone name
   if (!tsIso) return "";
   try {
     const tz = getTZ();
@@ -79,30 +78,59 @@ function escapeHTML(str) {
     .replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
 }
 
-/* ---------------- Changelog ---------------- */
+/* ---------------- Changelog (wider coverage) ---------------- */
+function firstNonEmptyText(obj, keys) {
+  for (const k of keys) {
+    if (obj == null) continue;
+    const v = obj[k];
+    if (v == null) continue;
+    if (typeof v === "string" && v.trim().length) return v;
+    if (Array.isArray(v) && v.length) return v.join("\n");
+    if (typeof v === "object") {
+      // some integrations hand you {body:"...", ...}
+      const nested = v.body || v.text || v.content;
+      if (typeof nested === "string" && nested.trim().length) return nested;
+    }
+  }
+  return "";
+}
+
 async function buildChangelogHTML(stateObj) {
   const attr = stateObj?.attributes || {};
   const title = attr.title || attr.friendly_name || stateObj?.entity_id || "Item";
   const from = attr.installed_version || "";
   const to = attr.latest_version || "";
 
-  const note = attr.release_summary || attr.release_notes || attr.release_note ||
-               attr.changelog || attr.release_description || "";
-  const releaseUrl = attr.release_url || attr.release_url_template || "";
+  // expanded key set to catch HACS, add-ons, custom updaters, etc.
+  const note = firstNonEmptyText(attr, [
+    "release_summary",
+    "release_notes",
+    "release_note",
+    "release_description",
+    "changelog",
+    "what_new",
+    "change_log",
+    "body",
+    "release_body",
+    "changes",
+    "news"
+  ]);
+
+  const releaseUrl = attr.release_url || attr.release_page || attr.documentation || attr.release_url_template || "";
 
   if (note) {
     return `
-      <h2>${title}</h2>
-      <p class="vers">${from ? `${from} → ` : ""}${to || ""}</p>
-      <div class="md">${escapeHTML(note)}</div>
-      ${releaseUrl ? `<p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
+      <h2>${escapeHTML(title)}</h2>
+      <p class="vers">${from ? `${escapeHTML(from)} → ` : ""}${escapeHTML(to || "")}</p>
+      <div class="md"><pre style="white-space:pre-wrap">${escapeHTML(note)}</pre></div>
+      ${releaseUrl ? `<p><a href="${escapeHTML(releaseUrl)}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
     `;
   }
   return `
-    <h2>${title}</h2>
-    <p class="vers">${from ? `${from} → ` : ""}${to || ""}</p>
+    <h2>${escapeHTML(title)}</h2>
+    <p class="vers">${from ? `${escapeHTML(from)} → ` : ""}${escapeHTML(to || "")}</p>
     <p>No changelog text available.</p>
-    ${releaseUrl ? `<p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
+    ${releaseUrl ? `<p><a href="${escapeHTML(releaseUrl)}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
   `;
 }
 
@@ -269,45 +297,35 @@ class BatchUpdatesPanel extends HTMLElement {
 
       <style>
         ha-card{max-width:980px;margin:24px auto;display:block}
-
         .actions{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
         .spacer{flex:1}
-
         .statusbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:12px;background:#0b74de;color:#fff;margin-bottom:10px}
         .statusbar.done{background:#0f9d58}
         .statusbar button{margin-left:auto;padding:4px 10px;border:0;border-radius:8px;cursor:pointer}
-
         .spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.6);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
         @keyframes spin{to{transform:rotate(360deg)}}
-
         ul{list-style:none;margin:0;padding:0}
         .row{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ddd;padding:10px 0}
         .left{display:flex;align-items:center;gap:10px;min-width:0}
         .avatar{width:28px;height:28px;border-radius:6px;flex:0 0 28px;object-fit:cover;background:#eee;box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)}
         .avatar[src$=".svg"],.avatar[src^="data:image/svg"]{object-fit:contain;padding:2px;background:#0b74de}
-
-        /* --- Log table full-width --- */
         .log{margin-top:8px}
         .log h3{margin:8px 0}
         table.full{width:100%;border-collapse:collapse;font-size:.95em;table-layout:fixed}
         table.full thead th{font-weight:700}
         table.full th, table.full td{padding:8px 10px;border-bottom:1px solid #ccc;text-align:left;vertical-align:top}
-        table.full th:nth-child(1), table.full td:nth-child(1){width:24%;}
-        table.full th:nth-child(2), table.full td:nth-child(2){width:36%;}
-        table.full th:nth-child(3), table.full td:nth-child(3){width:15%;}
-        table.full th:nth-child(4), table.full td:nth-child(4){width:25%;}
+        table.full th:nth-child(1), table.full td:nth-child(1){width:24%}
+        table.full th:nth-child(2), table.full td:nth-child(2){width:36%}
+        table.full th:nth-child(3), table.full td:nth-child(3){width:15%}
+        table.full th:nth-child(4), table.full td:nth-child(4){width:25%}
         table.full td.reason{white-space:normal;word-wrap:break-word}
-
         .badge{padding:2px 8px;border-radius:12px;font-size:.85em;font-weight:600;display:inline-block}
         .badge.ok{background:#0f9d58;color:white}
         .badge.err{background:#d93025;color:white}
         .badge.warn{background:#e6a700;color:black}
-
         .btn.small{margin-top:8px;font-size:.85em;padding:4px 10px}
-
         .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fff;padding:10px 14px;border-radius:10px;opacity:0;transition:.2s}
         .toast.show{opacity:1}
-
         .modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.4);z-index:9999}
         .modal.open{display:flex}
         .modal-card{width:min(820px,96vw);max-height:85vh;overflow:auto;border-radius:16px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.25)}
@@ -317,9 +335,8 @@ class BatchUpdatesPanel extends HTMLElement {
       </style>`;
     this.shadowRoot.innerHTML=html;
 
-    // Buttons
-    const root=this.shadowRoot;
-    const byId=id=>root.getElementById(id);
+    const root=this.shadowRoot, byId=id=>root.getElementById(id);
+
     if(byId("all")) byId("all").onclick=()=>{this._selected=new Set(this._updatesList().map(s=>s.entity_id));this.render();};
     if(byId("none")) byId("none").onclick=()=>{this._selected.clear();this.render();};
     if(byId("run")) byId("run").onclick=()=>this._run();
@@ -336,7 +353,7 @@ class BatchUpdatesPanel extends HTMLElement {
       });
     });
 
-    // Modal changelog
+    // Changelog modal
     root.querySelectorAll('button[data-info]').forEach(btn=>{
       btn.onclick=async()=>{
         const modal=byId("modal"), body=this.shadowRoot.querySelector(".modal-body");
@@ -350,7 +367,7 @@ class BatchUpdatesPanel extends HTMLElement {
     if(byId("modal-close")) byId("modal-close").onclick = () => byId("modal").classList.remove("open");
     if(byId("modal-close-1")) byId("modal-close-1").onclick = () => byId("modal").classList.remove("open");
 
-    // Auto-scroll to the newest row
+    // Auto-scroll to newest row
     const tbody = this.shadowRoot.querySelector(".log table tbody");
     if (tbody) tbody.lastElementChild?.scrollIntoView({ behavior: "smooth", block: "end" });
   }
