@@ -1,83 +1,12 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Batch Updates</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="preload" href="/ha_batch_updates/styles.css" as="style" />
-  <link rel="stylesheet" href="/ha_batch_updates/styles.css" />
-</head>
-<body>
-  <div id="app">
-    <header class="bu-header">
-      <h1>Batch Updates</h1>
-      <div class="bu-actions">
-        <button id="btn-refresh">Refresh logs</button>
-        <button id="btn-reboot">Reboot now</button>
-      </div>
-    </header>
-
-    <section class="bu-pending">
-      <div class="bu-logs-header">
-        <h2>Updates available</h2>
-        <div class="bu-logs-controls">
-          <button id="btn-refresh-pending">Refresh list</button>
-          <button id="btn-install-selected" class="accent">Run selected updates</button>
-        </div>
-      </div>
-
-      <div class="bu-log-table-wrap">
-        <table class="bu-log-table" id="pending-table" aria-label="Updates available">
-          <thead>
-            <tr>
-              <th style="width:40px;"><input type="checkbox" id="select-all" /></th>
-              <th>Item</th>
-              <th style="min-width:150px;">Installed</th>
-              <th style="min-width:150px;">Latest</th>
-              <th style="min-width:140px;">Changelog</th>
-            </tr>
-          </thead>
-          <tbody id="pending-tbody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="bu-logs">
-      <div class="bu-logs-header">
-        <h2>Update log</h2>
-        <div class="bu-logs-controls">
-          <span id="range-label"></span>
-          <button id="btn-show-more">Show more</button>
-          <button id="btn-show-less" class="secondary">Show less</button>
-      </div></div>
-
-      <div class="bu-log-table-wrap">
-        <table class="bu-log-table" id="log-table" aria-label="Update log">
-          <thead>
-            <tr>
-              <th style="min-width:180px;">Time</th>
-              <th>Item</th>
-              <th style="min-width:120px;">Result</th>
-              <th>Reason</th>
-            </tr>
-          </thead>
-          <tbody id="log-tbody"></tbody>
-        </table>
-      </div>
-    </section>
-  </div>
-
-  <!-- Changelog Modal -->
-  <dialog id="changelog-modal">
-    <div class="modal-body">
-      <h3 id="cl-title">Changelog</h3>
-      <div id="cl-content" class="cl-content"></div>
-      <div class="modal-actions">
-        <button id="cl-close">Close</button>
-      </div>
-    </div>
-  </dialog>
-
-  <script src="/ha_batch_updates/batch-updates.js"></script>
-</body>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Batch Updates</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+  </head>
+  <body>
+    <!-- Loads the full ES module -->
+    <script type="module" src="./batch-updates.js"></script>
+  </body>
 </html>
