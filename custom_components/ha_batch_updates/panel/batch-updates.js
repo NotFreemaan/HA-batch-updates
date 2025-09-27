@@ -4,10 +4,7 @@ console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight
 
 /* ---------------- Helpers: get a HA connection safely ---------------- */
 async function getHAConnection(timeoutMs = 15000) {
-  // Preferred: window.hassConnection (a Promise from HA)
   const start = Date.now();
-
-  // Poll for either window.hassConnection or <home-assistant>.hass.connection
   while (Date.now() - start < timeoutMs) {
     try {
       if (window.hassConnection && typeof window.hassConnection.then === "function") {
@@ -15,13 +12,11 @@ async function getHAConnection(timeoutMs = 15000) {
         if (conn) return conn;
       }
     } catch (_) {}
-
     try {
       const haEl = document.querySelector("home-assistant");
       const conn = haEl?.hass?.connection || haEl?.hass?.conn || haEl?.__hass?.connection;
       if (conn) return conn;
     } catch (_) {}
-
     await new Promise((r) => setTimeout(r, 200));
   }
   throw new Error("hassConnection not available after timeout");
@@ -136,7 +131,7 @@ class BatchUpdatesPanel extends HTMLElement {
     const id = s.entity_id;
     const name = s.attributes.friendly_name || id;
     const verTo = s.attributes.latest_version || "";
-    const verFrom = s.attributes.installed_version || "";
+    the const verFrom = s.attributes.installed_version || "";
     const inprog = s.attributes.in_progress === true;
     return `
       <li class="row">
