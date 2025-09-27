@@ -1,4 +1,7 @@
-// Batch Updates panel – iframe-aware, grabs hassConnection from parent/top, with REST fallback
+// Batch Updates panel – iframe-aware, WS/REST client
+// - Buttons are native <button>
+// - Hides entity_id next to names
+// - Shows a status bar while batch is running and disables controls
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
@@ -9,12 +12,10 @@ async function getHAClient(timeoutMs = 15000) {
   async function tryGetConn(host) {
     try {
       if (!host) return null;
-      // Preferred contract: Promise that resolves to {conn}
       if (host.hassConnection && typeof host.hassConnection.then === "function") {
         const { conn } = await host.hassConnection;
         if (conn) return { mode: "ws", conn, hass: host.hass || null };
       }
-      // Direct hass.connection (older/newer builds)
       const hass = host.hass || host.__hass;
       const conn = hass?.connection || hass?.conn;
       if (conn) return { mode: "ws", conn, hass: hass || null };
@@ -22,7 +23,6 @@ async function getHAClient(timeoutMs = 15000) {
     return null;
   }
 
-  // Try current window, then parent, then top (iframe scenarios)
   while (Date.now() - start < timeoutMs) {
     let client =
       (await tryGetConn(window)) ||
@@ -35,7 +35,6 @@ async function getHAClient(timeoutMs = 15000) {
     await new Promise((r) => setTimeout(r, 200));
   }
 
-  // REST fallback (last resort). We need an access token; try to read from parent/top.
   const token =
     window?.parent?.hass?.auth?.data?.access_token ||
     window?.top?.hass?.auth?.data?.access_token ||
@@ -57,12 +56,9 @@ async function getHAClient(timeoutMs = 15000) {
       return await res.json();
     },
     async getLog(limit = 100) {
-      // No REST endpoint for our custom log; just return empty in REST mode
-      return { entries: [] };
+      return { entries: [] }; // no REST endpoint for our custom log
     },
-    async clearLog() {
-      return { ok: true };
-    },
+    async clearLog() { return { ok: true }; },
     async callService(domain, service, service_data) {
       const res = await fetch(`/api/services/${domain}/${service}`, {
         method: "POST",
@@ -75,7 +71,6 @@ async function getHAClient(timeoutMs = 15000) {
       if (!res.ok) throw new Error(`REST call_service ${domain}.${service} failed: ${res.status}`);
       return await res.json();
     },
-    // subscribe to state changes is not supported in REST fallback
     subscribeStates(handler) {
       console.warn("[Batch Updates] REST mode: live updates disabled");
       return () => {};
@@ -92,26 +87,42 @@ class BatchUpdatesPanel extends HTMLElement {
     this._states = {};
     this._selected = new Set();
     this._reboot = false;
-    this._backup = true; // default: make backups
+    this._backup = true;
     this._log = [];
     this._unsub = null;
-    this._client = null; // {mode:'ws'|'rest', ...}
+    this._client = null;
+    this._running = false;
+    this._runWatchTimer = null;
   }
 
-  connectedCallback() {
-    this.render(); // initial shell
-    this._init();
+  connectedCallback() { this.render(); this._init(); }
+  disconnectedCallback() {
+    if (this._unsub) this._unsub();
+    if (this._runWatchTimer) clearInterval(this._runWatchTimer);
   }
-  disconnectedCallback() { if (this._unsub) this._unsub(); }
 
   async _init() {
     try {
       this._client = await getHAClient(20000);
       if (this._client.mode === "ws") {
-        console.info("[Batch Updates] hassConnection ready (WS)");
-        await this._subscribeWS();
+        const conn = this._client.conn;
+        const resp = await conn.sendMessagePromise({ type: "get_states" });
+        this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
+        await this._loadLogWS();
+        this.render();
+        this._unsub = await conn.subscribeMessage(
+          (evt) => {
+            const ent = evt?.event?.data?.entity_id;
+            if (ent && ent.startsWith("update.")) {
+              conn.sendMessagePromise({ type: "get_states" }).then((all) => {
+                this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
+                this.render();
+              });
+            }
+          },
+          { type: "subscribe_events", event_type: "state_changed" }
+        );
       } else {
-        console.info("[Batch Updates] client ready (REST fallback)");
         await this._loadOnceREST();
       }
     } catch (e) {
@@ -119,41 +130,15 @@ class BatchUpdatesPanel extends HTMLElement {
       this.shadowRoot.innerHTML = `
         <div style="padding:16px">
           <h3>Home Assistant connection not ready</h3>
-          <p>This panel is loaded in an iframe and couldn't access HA's connection.
-             Try a hard refresh, or ensure you're logged in on this browser.</p>
+          <p>This panel is loaded in an iframe and couldn't access HA's connection.</p>
           <details><summary>Error</summary><pre style="white-space:pre-wrap">${String(e)}</pre></details>
         </div>`;
     }
   }
 
-  /* ---------- WS mode ---------- */
-  async _subscribeWS() {
-    const conn = this._client.conn;
-    // Load initial states
-    const resp = await conn.sendMessagePromise({ type: "get_states" });
-    this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
-    await this._loadLogWS();
-    this.render();
-
-    // Subscribe to live updates for update.* entities
-    this._unsub = await conn.subscribeMessage(
-      (evt) => {
-        const ent = evt?.event?.data?.entity_id;
-        if (ent && ent.startsWith("update.")) {
-          conn.sendMessagePromise({ type: "get_states" }).then((all) => {
-            this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
-            this.render();
-          });
-        }
-      },
-      { type: "subscribe_events", event_type: "state_changed" }
-    );
-  }
-
   async _loadLogWS(limit = 100) {
-    const conn = this._client.conn;
     try {
-      const res = await conn.sendMessagePromise({ type: "ha_batch_updates/get_log", limit });
+      const res = await this._client.conn.sendMessagePromise({ type: "ha_batch_updates/get_log", limit });
       this._log = res.entries || [];
     } catch (e) {
       console.warn("[Batch Updates] WS log fetch failed:", e);
@@ -161,7 +146,6 @@ class BatchUpdatesPanel extends HTMLElement {
     }
   }
 
-  /* ---------- REST mode ---------- */
   async _loadOnceREST() {
     const resp = await this._client.getStates();
     this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
@@ -185,9 +169,8 @@ class BatchUpdatesPanel extends HTMLElement {
     return Object.values(this._states)
       .filter((s) => s.entity_id?.startsWith?.("update.") && s.state === "on")
       .sort((a, b) =>
-        (a.attributes.friendly_name || a.entity_id).localeCompare(
-          b.attributes.friendly_name || b.entity_id
-        )
+        (a.attributes.friendly_name || a.entity_id)
+          .localeCompare(b.attributes.friendly_name || b.entity_id)
       );
   }
 
@@ -200,32 +183,85 @@ class BatchUpdatesPanel extends HTMLElement {
   _selectAll() { this._selected = new Set(this._updatesList().map((s) => s.entity_id)); this.render(); }
   _selectNone() { this._selected.clear(); this.render(); }
 
+  _anySelectedInProgress() {
+    const ids = Array.from(this._selected);
+    for (const id of ids) {
+      const st = this._states[id];
+      if (!st) continue;
+      if (st.attributes?.in_progress === true) return true;
+    }
+    return false;
+  }
+
+  _allSelectedFinishedOrIdle() {
+    // Finished when none of the selected are 'on' with in_progress true
+    const ids = Array.from(this._selected);
+    for (const id of ids) {
+      const st = this._states[id];
+      if (!st) continue;
+      if (st.attributes?.in_progress === true) return false;
+    }
+    return true;
+  }
+
+  _startRunWatcher() {
+    if (this._runWatchTimer) clearInterval(this._runWatchTimer);
+    // Every 2s, if in WS mode, refresh states; in REST, refetch states
+    this._runWatchTimer = setInterval(async () => {
+      try {
+        if (this._client.mode === "ws") {
+          const all = await this._client.conn.sendMessagePromise({ type: "get_states" });
+          this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
+        } else {
+          const all = await this._client.getStates();
+          this._states = Object.fromEntries(all.map((s) => [s.entity_id, s]));
+        }
+        this.render();
+        if (this._allSelectedFinishedOrIdle()) {
+          this._running = false;
+          clearInterval(this._runWatchTimer);
+          this._runWatchTimer = null;
+          this._toast("Batch finished. Check the log for details.");
+          this.render();
+        }
+      } catch (e) {
+        console.warn("[Batch Updates] run watcher error:", e);
+      }
+    }, 2000);
+  }
+
   async _run() {
     if (this._selected.size === 0) { alert("Select at least one update."); return; }
-    if (this._client.mode === "ws") {
-      await this._client.conn.sendMessagePromise({
-        type: "call_service",
-        domain: "ha_batch_updates",
-        service: "run",
-        service_data: {
+    this._running = true;
+    this.render();
+
+    try {
+      if (this._client.mode === "ws") {
+        await this._client.conn.sendMessagePromise({
+          type: "call_service",
+          domain: "ha_batch_updates",
+          service: "run",
+          service_data: {
+            entities: Array.from(this._selected),
+            reboot_host: this._reboot,
+            backup: this._backup,
+          },
+        });
+      } else {
+        await this._client.callService("ha_batch_updates", "run", {
           entities: Array.from(this._selected),
           reboot_host: this._reboot,
           backup: this._backup,
-        },
-      });
-    } else {
-      await this._client.callService("ha_batch_updates", "run", {
-        entities: Array.from(this._selected),
-        reboot_host: this._reboot,
-        backup: this._backup,
-      });
-    }
-    this._toast("Batch started. Logs will appear below.");
-    setTimeout(async () => {
-      if (this._client.mode === "ws") await this._loadLogWS();
-      else await this._loadOnceREST();
+        });
+      }
+      this._toast("Batch started…");
+      this._startRunWatcher();
+    } catch (e) {
+      this._running = false;
+      this._toast(`Error starting batch: ${String(e)}`);
+      console.error(e);
       this.render();
-    }, 2000);
+    }
   }
 
   _row(s) {
@@ -237,11 +273,10 @@ class BatchUpdatesPanel extends HTMLElement {
     return `
       <li class="row">
         <label class="left">
-          <input type="checkbox" data-ent="${id}" ${this._selected.has(id) ? "checked" : ""} ${inprog ? "disabled" : ""}>
+          <input type="checkbox" data-ent="${id}" ${this._selected.has(id) ? "checked" : ""} ${inprog || this._running ? "disabled" : ""}>
           <span class="name">${name}</span>
-          <span class="eid">(${id})</span>
         </label>
-        <span class="ver">${verFrom ? `${verFrom} ` : ""}${verTo ? `&rarr; ${verTo}` : ""}</span>
+        <span class="ver">${verFrom ? `${verFrom} ` : ""}${verTo ? `&rarr; ${verTo}` : ""}${inprog ? ' <span class="spinner" aria-label="In progress"></span>' : ''}</span>
       </li>
     `;
   }
@@ -266,31 +301,46 @@ class BatchUpdatesPanel extends HTMLElement {
   }
 
   _toast(msg) {
-    const sb = this.shadowRoot.querySelector("mwc-snackbar");
-    if (sb) { sb.labelText = msg; sb.open(); }
+    const sb = this.shadowRoot.querySelector(".toast");
+    if (!sb) return;
+    sb.textContent = msg;
+    sb.classList.add("show");
+    setTimeout(() => sb.classList.remove("show"), 2500);
   }
 
   render() {
     const list = this._updatesList();
+    const count = list.length;
+    const disabled = this._running;
     const html = `
       <ha-card header="Batch Updates">
-        <div class="content">
-          <div class="actions">
-            <mwc-button id="all" dense>Select all</mwc-button>
-            <mwc-button id="none" dense>Clear</mwc-button>
+        ${this._running ? `
+          <div class="statusbar" role="status" aria-live="polite">
+            <span class="spinner" aria-hidden="true"></span>
+            <strong>Updating…</strong>
+            <span class="muted">Batch is running; controls are disabled.</span>
+            <button class="btn btn-ghost close-status" aria-label="Hide status">×</button>
+          </div>
+        ` : ""}
+
+        <div class="content ${disabled ? 'is-disabled' : ''}">
+          <div class="actions" role="toolbar" aria-label="Batch update controls">
+            <button id="all" class="btn btn-outlined" ${disabled ? "disabled" : ""} aria-label="Select all pending updates">Select all</button>
+            <button id="none" class="btn btn-outlined" ${disabled ? "disabled" : ""} aria-label="Clear selection">Clear</button>
+            <span class="count-pill" title="Pending updates">${count} pending</span>
             <span class="spacer"></span>
             <label class="opt">
-              <input id="backup" type="checkbox" ${this._backup ? "checked" : ""}>
+              <input id="backup" type="checkbox" ${this._backup ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="Back up before each update">
               Back up before each update
             </label>
             <label class="opt">
-              <input id="reboot" type="checkbox" ${this._reboot ? "checked" : ""}>
+              <input id="reboot" type="checkbox" ${this._reboot ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="Reboot host at end">
               Reboot host at end
             </label>
-            <mwc-button id="run" raised>Update now</mwc-button>
+            <button id="run" class="btn btn-raised" ${disabled ? "disabled" : ""} aria-label="Run updates now">Update now</button>
           </div>
 
-          ${list.length === 0
+          ${count === 0
             ? `<p>No updates available 🎉</p>`
             : `<ul>${list.map((s) => this._row(s)).join("")}</ul>`}
         </div>
@@ -299,8 +349,8 @@ class BatchUpdatesPanel extends HTMLElement {
           <div class="logbar">
             <h3>Update log (latest)</h3>
             <span class="spacer"></span>
-            <mwc-button id="refreshLog" dense>Refresh</mwc-button>
-            <mwc-button id="clearLog" dense>Clear log</mwc-button>
+            <button id="refreshLog" class="btn btn-ghost" aria-label="Refresh log">Refresh</button>
+            <button id="clearLog" class="btn btn-ghost" aria-label="Clear log">Clear log</button>
           </div>
           <table>
             <thead><tr><th>Time (UTC)</th><th>Item</th><th>Result</th><th>Reason / Action</th></tr></thead>
@@ -308,7 +358,7 @@ class BatchUpdatesPanel extends HTMLElement {
           </table>
         </div>
 
-        <mwc-snackbar></mwc-snackbar>
+        <div class="toast" role="status" aria-live="polite"></div>
       </ha-card>
 
       <style>
@@ -317,38 +367,108 @@ class BatchUpdatesPanel extends HTMLElement {
         .actions{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
         .opt{display:flex;align-items:center;gap:6px}
         .spacer{flex:1}
+
+        /* Disabled mode */
+        .is-disabled{opacity:.7}
+        .is-disabled .btn{pointer-events:none}
+        .is-disabled input[type="checkbox"]{pointer-events:none}
+
+        /* Status bar */
+        .statusbar{
+          display:flex;align-items:center;gap:10px;padding:10px 14px;
+          background:var(--info-color, #0b74de);color:#fff;border-top-left-radius:12px;border-top-right-radius:12px
+        }
+        .statusbar .muted{opacity:.9}
+        .close-status{
+          margin-left:auto
+        }
+
+        /* Spinner */
+        .spinner{
+          display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.6);
+          border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px
+        }
+        @keyframes spin{to{transform:rotate(360deg)}}
+
+        /* Buttons */
+        .btn{
+          appearance:none;border:0;cursor:pointer;padding:8px 12px;
+          border-radius:12px;font-weight:600;transition:box-shadow .15s, filter .15s;
+          background:var(--card-background-color,#fff);color:var(--primary-text-color,#111);
+          box-shadow:inset 0 0 0 2px var(--divider-color,#ccc);
+        }
+        .btn[disabled]{opacity:.6;cursor:not-allowed}
+        .btn:hover{filter:brightness(0.98)}
+        .btn:focus{outline:2px solid var(--primary-color);outline-offset:2px}
+        .btn-raised{
+          background:var(--primary-color);color:#fff;box-shadow:none;
+        }
+        .btn-raised:hover{filter:brightness(1.02)}
+        .btn-outlined{
+          background:transparent;color:var(--primary-text-color,#111);
+        }
+        .btn-ghost{
+          background:transparent;color:var(--primary-text-color,#111);
+          box-shadow:none;opacity:.9
+        }
+
+        .count-pill{
+          display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;
+          font-weight:700;font-size:.9em;background: var(--primary-color);color: white;line-height:1.8;
+        }
+
         ul{list-style:none;margin:0;padding:0}
         .row{display:flex;align-items:center;justify-content:space-between;
              border-bottom:1px solid var(--divider-color);padding:10px 0}
         .left{display:flex;align-items:center;gap:10px}
         .name{font-weight:600}
-        .eid{opacity:.6;font-size:.9em}
-        .ver{opacity:.8}
+        .ver{opacity:.9}
+        /* Removed .eid display */
+
         .log{padding:0 16px 16px}
         .logbar{display:flex;align-items:center;margin:8px 0}
         table{width:100%;border-collapse:collapse}
         th,td{padding:8px;border-bottom:1px solid var(--divider-color);text-align:left}
         .badge{padding:2px 8px;border-radius:12px;font-size:.85em}
-        .badge.ok{background:var(--success-color, #0f9d58);color:white}
-        .badge.err{background:var(--error-color, #d93025);color:white}
+        .badge.ok{background:var(--success-color,#0f9d58);color:white}
+        .badge.err{background:var(--error-color,#d93025);color:white}
         .badge.warn{background:#e6a700;color:black}
         .badge.neutral{background:#999;color:white}
         .ts{white-space:nowrap}
+
+        /* Toast */
+        .toast{
+          position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
+          background:rgba(0,0,0,.85);color:#fff;padding:10px 14px;border-radius:10px;
+          opacity:0;pointer-events:none;transition:opacity .2s;
+        }
+        .toast.show{opacity:1}
       </style>
     `;
     this.shadowRoot.innerHTML = html;
 
     const root = this.shadowRoot;
+    const cs = (id) => root.getElementById(id);
+
+    const closeBtn = root.querySelector(".close-status");
+    if (closeBtn) closeBtn.onclick = () => {
+      this._running = false;
+      if (this._runWatchTimer) { clearInterval(this._runWatchTimer); this._runWatchTimer = null; }
+      this.render();
+    };
+
+    if (cs("all")) cs("all").onclick = () => this._selectAll();
+    if (cs("none")) cs("none").onclick = () => this._selectNone();
+    if (cs("run")) cs("run").onclick = () => this._run();
+
     root.querySelectorAll('input[type="checkbox"][data-ent]').forEach((cb) => {
       cb.addEventListener("change", (e) => this._togglePick(e));
     });
-    root.getElementById("all").onclick = () => this._selectAll();
-    root.getElementById("none").onclick = () => this._selectNone();
-    root.getElementById("run").onclick = () => this._run();
-    root.getElementById("reboot").onchange = (e) => { this._reboot = e.target.checked; };
-    root.getElementById("backup").onchange = (e) => { this._backup = e.target.checked; };
-    const refresh = root.getElementById("refreshLog");
-    const clear = root.getElementById("clearLog");
+    const rb = cs("reboot"); if (rb) rb.onchange = (e) => { this._reboot = e.target.checked; };
+    const bk = cs("backup"); if (bk) bk.onchange = (e) => { this._backup = e.target.checked; };
+
+    const refresh = cs("refreshLog");
+    const clear = cs("clearLog");
     if (refresh) refresh.onclick = async () => {
       if (this._client.mode === "ws") { await this._loadLogWS(); }
       else { await this._loadOnceREST(); }
@@ -360,7 +480,7 @@ class BatchUpdatesPanel extends HTMLElement {
 
 customElements.define("batch-updates-panel", BatchUpdatesPanel);
 
-// For iframe (no HA loader), just mount on DOM ready
+// For iframe, mount on DOM ready
 if (document.readyState === "complete" || document.readyState === "interactive") {
   setTimeout(() => document.body.appendChild(document.createElement("batch-updates-panel")), 0);
 } else {
