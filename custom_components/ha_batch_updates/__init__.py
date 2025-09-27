@@ -1,193 +1,45 @@
-from __future__ import annotations
+// Helper: resolve an icon URL for an add-on
+function getAddonIconUrl(addon) {
+  // Common fields you might encounter from add-on sources:
+  const candidates = [
+    addon?.icon_url,
+    addon?.icon,         // some sources use 'icon'
+    addon?.images?.icon, // or nested
+  ].filter(Boolean);
 
-import logging
-from pathlib import Path
-from datetime import datetime, timezone
-from typing import Any
+  if (candidates.length && String(candidates[0]).trim()) {
+    return candidates[0];
+  }
+  // Fallback to our packaged SVG ONLY when missing
+  return "/ha_batch_updates_static/update.svg";
+}
 
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.components.frontend import add_extra_js_url
-from homeassistant.components.http import StaticPathConfig
-from homeassistant.components import websocket_api, panel_custom
+// Example render (adapt for Lit/React/etc.)
+function renderAddonCard(addon) {
+  const iconUrl = getAddonIconUrl(addon);
 
-_LOGGER = logging.getLogger(__name__)
+  // Create <img> with error fallback (handles broken remote URLs)
+  const img = document.createElement("img");
+  img.className = "addon-icon";
+  img.src = iconUrl;
+  img.alt = "";
+  img.width = 32;
+  img.height = 32;
+  img.referrerPolicy = "no-referrer";
 
-DOMAIN = "ha_batch_updates"
+  img.onerror = () => {
+    img.onerror = null; // prevent loops
+    img.src = "/ha_batch_updates_static/update.svg";
+  };
 
-# Static mount that serves files in <integration>/panel
-STATIC_URL = "/ha-batch-updates-static"
+  const card = document.createElement("div");
+  card.className = "addon-card";
+  card.appendChild(img);
 
-# Your panel JS module (served from STATIC_URL)
-PANEL_JS_URL = f"{STATIC_URL}/panel/batch-updates.js"
+  const title = document.createElement("div");
+  title.className = "addon-title";
+  title.textContent = addon?.name ?? "Unknown add-on";
+  card.appendChild(title);
 
-# Sidebar URL path
-SIDEBAR_URL_PATH = "batch-updates"
-
-# In-memory log store key
-LOG_KEY = f"{DOMAIN}_log"
-
-
-async def _ensure_static_and_resources(hass: HomeAssistant) -> None:
-    """Register static mount and preload panel JS."""
-    panel_dir = Path(__file__).parent / "panel"
-    panel_dir.mkdir(exist_ok=True)
-
-    # Serve /ha-batch-updates-static/* from <integration>/panel
-    try:
-        await hass.http.async_register_static_paths(
-            [
-                StaticPathConfig(
-                    url_path=STATIC_URL,
-                    path=str(panel_dir),
-                    cache_headers=False,
-                )
-            ]
-        )
-        _LOGGER.debug("Registered static path: %s -> %s", STATIC_URL, panel_dir)
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.exception("Failed to register static path: %s", e)
-
-    # Preload panel JS (optional)
-    try:
-        add_extra_js_url(hass, PANEL_JS_URL)
-        _LOGGER.debug("Added panel JS: %s", PANEL_JS_URL)
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.exception("Failed to add panel JS: %s", e)
-
-
-async def _register_sidebar_panel(hass: HomeAssistant) -> None:
-    """
-    Create/replace the sidebar panel using panel_custom.
-    NOTE: module_url MUST be a top-level arg (not only inside config).
-    """
-    # Remove existing, if present
-    try:
-        await panel_custom.async_remove_panel(hass, SIDEBAR_URL_PATH)
-    except Exception:
-        pass
-
-    try:
-        await panel_custom.async_register_panel(
-            hass=hass,
-            frontend_url_path=SIDEBAR_URL_PATH,
-            webcomponent_name="ha-panel-custom",  # HA's generic custom panel container
-            sidebar_title="Batch Updates",
-            sidebar_icon="mdi:update",
-            module_url=PANEL_JS_URL,              # <- REQUIRED top-level arg
-            require_admin=False,
-            # Optional config passed to ha-panel-custom:
-            config={
-                "embed_iframe": True,
-                "trust_external": False,
-            },
-        )
-        _LOGGER.debug("Sidebar panel registered at /%s", SIDEBAR_URL_PATH)
-    except Exception as e:  # noqa: BLE001
-        _LOGGER.exception("Failed to register sidebar panel: %s", e)
-
-
-def _register_ws(hass: HomeAssistant) -> None:
-    """Register websocket commands for log access."""
-    async def _ws_get_log(
-        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-    ) -> None:
-        limit = msg.get("limit", 100)
-        entries = hass.data.get(LOG_KEY, [])[-limit:]
-        await connection.send_result(msg["id"], {"entries": entries})
-
-    async def _ws_clear_log(
-        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-    ) -> None:
-        hass.data[LOG_KEY] = []
-        await connection.send_result(msg["id"], {"ok": True})
-
-    websocket_api.async_register_command(hass, f"{DOMAIN}/get_log", _ws_get_log)
-    websocket_api.async_register_command(hass, f"{DOMAIN}/clear_log", _ws_clear_log)
-    _LOGGER.debug("WebSocket commands registered")
-
-
-def _register_services(hass: HomeAssistant) -> None:
-    """Register the batch updates service."""
-    async def async_service_run(call: ServiceCall) -> None:
-        entities = call.data.get("entities") or []
-        reboot_host = bool(call.data.get("reboot_host"))
-        backup = bool(call.data.get("backup"))
-
-        async def _log(entry: dict[str, Any]) -> None:
-            entry = dict(entry)
-            entry.setdefault("ts", datetime.now(timezone.utc).isoformat())
-            hass.data.setdefault(LOG_KEY, []).append(entry)
-            if len(hass.data[LOG_KEY]) > 1000:
-                hass.data[LOG_KEY] = hass.data[LOG_KEY][-700:]
-
-        await _log(
-            {
-                "type": "batch_start",
-                "result": "started",
-                "action": f"backup={backup}, reboot={reboot_host}",
-            }
-        )
-
-        for ent in entities:
-            st = hass.states.get(ent)
-            name = (st and st.attributes.get("friendly_name")) or ent
-            try:
-                await hass.services.async_call(
-                    "update",
-                    "install",
-                    {"entity_id": ent, "backup": backup},
-                    blocking=True,
-                )
-                await _log({"entity_id": ent, "friendly_name": name, "result": "success"})
-            except Exception as e:  # noqa: BLE001
-                await _log(
-                    {
-                        "entity_id": ent,
-                        "friendly_name": name,
-                        "result": "failed",
-                        "reason": str(e)},
-                )
-
-        if reboot_host:
-            try:
-                await hass.services.async_call("homeassistant", "restart", {}, blocking=False)
-                await _log({"type": "ha_restart", "result": "started"})
-            except Exception as e:  # noqa: BLE001
-                await _log({"type": "ha_restart", "result": "failed", "reason": str(e)})
-
-        await _log({"type": "batch_finishing", "result": "batch_finishing", "action": "done"})
-
-    if not hass.services.has_service(DOMAIN, "run"):
-        hass.services.async_register(DOMAIN, "run", async_service_run)
-        _LOGGER.debug("Service %s.run registered", DOMAIN)
-
-
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """YAML setup (and shared init)."""
-    hass.data.setdefault(LOG_KEY, [])
-    await _ensure_static_and_resources(hass)
-    _register_ws(hass)
-    _register_services(hass)
-    await _register_sidebar_panel(hass)
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
-    """Config entry setup."""
-    hass.data.setdefault(LOG_KEY, [])
-    await _ensure_static_and_resources(hass)
-    _register_ws(hass)
-    _register_services(hass)
-    await _register_sidebar_panel(hass)
-    return True
-
-
-async def async_unload_entry(hass: HomeAssistant, entry) -> bool:
-    """Unload a config entry (remove the sidebar panel)."""
-    try:
-        await panel_custom.async_remove_panel(hass, SIDEBAR_URL_PATH)
-        _LOGGER.debug("Sidebar panel removed: /%s", SIDEBAR_URL_PATH)
-    except Exception:
-        pass
-    return True
+  return card;
+}
