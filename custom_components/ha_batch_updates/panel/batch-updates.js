@@ -1,4 +1,4 @@
-// Batch Updates panel – robust mount for various HA loader contracts (with extra logging)
+// Batch Updates panel – robust mount for various HA loader contracts (with logging)
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
