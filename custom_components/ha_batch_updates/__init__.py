@@ -1,4 +1,3 @@
-# custom_components/ha_batch_updates/__init__.py
 from __future__ import annotations
 
 import logging
@@ -8,33 +7,29 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.components.frontend import (
-    add_extra_js_url,
-    async_register_panel,
-    async_remove_panel,
-)
+from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
-from homeassistant.components import websocket_api
+from homeassistant.components import websocket_api, panel_custom
 
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "ha_batch_updates"
 
-# Static mount that serves files in <integration>/panel at this URL prefix:
+# Serve files in <integration>/panel under this URL prefix:
 STATIC_URL = "/ha-batch-updates-static"
 
-# Your panel JS module path (served from STATIC_URL)
+# Your panel JS module (served from STATIC_URL)
 PANEL_JS_URL = f"{STATIC_URL}/panel/batch-updates.js"
 
-# Sidebar location (the URL path users click in the sidebar)
+# Sidebar path users click
 SIDEBAR_URL_PATH = "batch-updates"
 
-# In-memory log key
+# In-memory log
 LOG_KEY = f"{DOMAIN}_log"
 
 
 async def _ensure_static_and_resources(hass: HomeAssistant) -> None:
-    """Register static mount and (optionally) preload panel JS."""
+    """Register static mount and preload panel JS."""
     panel_dir = Path(__file__).parent / "panel"
     panel_dir.mkdir(exist_ok=True)
 
@@ -53,7 +48,7 @@ async def _ensure_static_and_resources(hass: HomeAssistant) -> None:
     except Exception as e:  # noqa: BLE001
         _LOGGER.exception("Failed to register static path: %s", e)
 
-    # Preload panel JS (optional; the panel also loads it when embedded)
+    # Preload panel JS (helps some builds)
     try:
         add_extra_js_url(hass, PANEL_JS_URL)
         _LOGGER.debug("Added panel JS: %s", PANEL_JS_URL)
@@ -61,30 +56,35 @@ async def _ensure_static_and_resources(hass: HomeAssistant) -> None:
         _LOGGER.exception("Failed to add panel JS: %s", e)
 
 
-def _register_sidebar_panel(hass: HomeAssistant) -> None:
-    """Create/replace the sidebar custom panel."""
-    # Remove any existing panel with the same path to avoid duplicates
+async def _register_sidebar_panel(hass: HomeAssistant) -> None:
+    """
+    Create/replace the sidebar panel using panel_custom.
+    We load our JS in an iframe, and the JS mounts the <batch-updates-panel>.
+    """
+    # Remove existing, if any (ignore errors)
     try:
-        async_remove_panel(hass, SIDEBAR_URL_PATH)
+        await panel_custom.async_remove_panel(hass, SIDEBAR_URL_PATH)
     except Exception:
         pass
 
-    # Register a custom panel that iframes our JS module
-    # HA expects a "custom" panel with a config containing module_url and embed_iframe.
-    async_register_panel(
-        hass=hass,
-        component_name="custom",
-        frontend_url_path=SIDEBAR_URL_PATH,
-        config={
-            "module_url": PANEL_JS_URL,
-            "embed_iframe": True,
-            "trust_external": False,
-        },
-        require_admin=False,
-        sidebar_title="Batch Updates",
-        sidebar_icon="mdi:update",
-    )
-    _LOGGER.debug("Sidebar panel registered at /%s", SIDEBAR_URL_PATH)
+    try:
+        await panel_custom.async_register_panel(
+            hass=hass,
+            frontend_url_path=SIDEBAR_URL_PATH,
+            webcomponent_name="ha-panel-custom",  # stock custom panel container
+            sidebar_title="Batch Updates",
+            sidebar_icon="mdi:update",
+            config={
+                # Tell the container to load our module inside an iframe
+                "module_url": PANEL_JS_URL,
+                "embed_iframe": True,
+                "trust_external": False,
+            },
+            require_admin=False,
+        )
+        _LOGGER.debug("Sidebar panel registered at /%s", SIDEBAR_URL_PATH)
+    except Exception as e:  # noqa: BLE001
+        _LOGGER.exception("Failed to register sidebar panel: %s", e)
 
 
 def _register_ws(hass: HomeAssistant) -> None:
@@ -117,7 +117,7 @@ def _register_services(hass: HomeAssistant) -> None:
         async def _log(entry: dict[str, Any]) -> None:
             entry = dict(entry)
             entry.setdefault("ts", datetime.now(timezone.utc).isoformat())
-            hass.data[LOG_KEY].append(entry)
+            hass.data.setdefault(LOG_KEY, []).append(entry)
             if len(hass.data[LOG_KEY]) > 1000:
                 hass.data[LOG_KEY] = hass.data[LOG_KEY][-700:]
 
@@ -170,7 +170,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     await _ensure_static_and_resources(hass)
     _register_ws(hass)
     _register_services(hass)
-    _register_sidebar_panel(hass)
+    await _register_sidebar_panel(hass)
     return True
 
 
@@ -180,16 +180,15 @@ async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
     await _ensure_static_and_resources(hass)
     _register_ws(hass)
     _register_services(hass)
-    _register_sidebar_panel(hass)
+    await _register_sidebar_panel(hass)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry) -> bool:
-    """Unload a config entry."""
+    """Unload a config entry (remove the sidebar panel)."""
     try:
-        async_remove_panel(hass, SIDEBAR_URL_PATH)
+        await panel_custom.async_remove_panel(hass, SIDEBAR_URL_PATH)
         _LOGGER.debug("Sidebar panel removed: /%s", SIDEBAR_URL_PATH)
     except Exception:
         pass
-    # Nothing persistent to unload; returning True tells HA it's cleaned up fine.
     return True
