@@ -96,7 +96,7 @@ class BatchUpdatesPanel extends HTMLElement {
 
   _row(s) {
     const id = s.entity_id;
-    const name = s.attributes.friendly_name || id;
+       const name = s.attributes.friendly_name || id;
     const verTo = s.attributes.latest_version || "";
     const verFrom = s.attributes.installed_version || "";
     const inprog = s.attributes.in_progress === true;
