@@ -1,25 +1,87 @@
-// Batch Updates panel – robust mount for various HA loader contracts (waits for hassConnection, with logging)
+// Batch Updates panel – iframe-aware, grabs hassConnection from parent/top, with REST fallback
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
-/* ---------------- Helpers: get a HA connection safely ---------------- */
-async function getHAConnection(timeoutMs = 15000) {
+/* ---------------- Helpers: get a HA connection or a thin client ---------------- */
+async function getHAClient(timeoutMs = 15000) {
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+
+  async function tryGetConn(host) {
     try {
-      if (window.hassConnection && typeof window.hassConnection.then === "function") {
-        const { conn } = await window.hassConnection;
-        if (conn) return conn;
+      if (!host) return null;
+      // Preferred contract: Promise that resolves to {conn}
+      if (host.hassConnection && typeof host.hassConnection.then === "function") {
+        const { conn } = await host.hassConnection;
+        if (conn) return { mode: "ws", conn, hass: host.hass || null };
       }
+      // Direct hass.connection (older/newer builds)
+      const hass = host.hass || host.__hass;
+      const conn = hass?.connection || hass?.conn;
+      if (conn) return { mode: "ws", conn, hass: hass || null };
     } catch (_) {}
-    try {
-      const haEl = document.querySelector("home-assistant");
-      const conn = haEl?.hass?.connection || haEl?.hass?.conn || haEl?.__hass?.connection;
-      if (conn) return conn;
-    } catch (_) {}
+    return null;
+  }
+
+  // Try current window, then parent, then top (iframe scenarios)
+  while (Date.now() - start < timeoutMs) {
+    let client =
+      (await tryGetConn(window)) ||
+      (await tryGetConn(window.parent)) ||
+      (await tryGetConn(window.top));
+    if (client) {
+      console.info("[Batch Updates] got WebSocket connection");
+      return client;
+    }
     await new Promise((r) => setTimeout(r, 200));
   }
-  throw new Error("hassConnection not available after timeout");
+
+  // REST fallback (last resort). We need an access token; try to read from parent/top.
+  const token =
+    window?.parent?.hass?.auth?.data?.access_token ||
+    window?.top?.hass?.auth?.data?.access_token ||
+    null;
+
+  if (!token) {
+    throw new Error("No hassConnection in iframe and no auth token found for REST fallback");
+  }
+
+  console.warn("[Batch Updates] using REST fallback (no websocket)");
+  const rest = {
+    mode: "rest",
+    token,
+    async getStates() {
+      const res = await fetch("/api/states", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`REST /api/states failed: ${res.status}`);
+      return await res.json();
+    },
+    async getLog(limit = 100) {
+      // No REST endpoint for our custom log; just return empty in REST mode
+      return { entries: [] };
+    },
+    async clearLog() {
+      return { ok: true };
+    },
+    async callService(domain, service, service_data) {
+      const res = await fetch(`/api/services/${domain}/${service}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(service_data || {}),
+      });
+      if (!res.ok) throw new Error(`REST call_service ${domain}.${service} failed: ${res.status}`);
+      return await res.json();
+    },
+    // subscribe to state changes is not supported in REST fallback
+    subscribeStates(handler) {
+      console.warn("[Batch Updates] REST mode: live updates disabled");
+      return () => {};
+    },
+  };
+  return rest;
 }
 
 /* ---------------- Web Component ---------------- */
@@ -33,41 +95,47 @@ class BatchUpdatesPanel extends HTMLElement {
     this._backup = true; // default: make backups
     this._log = [];
     this._unsub = null;
-    this._conn = null;
+    this._client = null; // {mode:'ws'|'rest', ...}
   }
 
   connectedCallback() {
-    console.info("[Batch Updates] connectedCallback");
     this.render(); // initial shell
-    this._init();  // async init
+    this._init();
   }
   disconnectedCallback() { if (this._unsub) this._unsub(); }
 
   async _init() {
     try {
-      this._conn = await getHAConnection(20000);
-      console.info("[Batch Updates] hassConnection ready");
-      await this._subscribe();
+      this._client = await getHAClient(20000);
+      if (this._client.mode === "ws") {
+        console.info("[Batch Updates] hassConnection ready (WS)");
+        await this._subscribeWS();
+      } else {
+        console.info("[Batch Updates] client ready (REST fallback)");
+        await this._loadOnceREST();
+      }
     } catch (e) {
-      console.error("[Batch Updates] could not obtain hassConnection:", e);
+      console.error("[Batch Updates] initialization error:", e);
       this.shadowRoot.innerHTML = `
         <div style="padding:16px">
           <h3>Home Assistant connection not ready</h3>
-          <p>Try reloading this page, or restarting Home Assistant's frontend.</p>
+          <p>This panel is loaded in an iframe and couldn't access HA's connection.
+             Try a hard refresh, or ensure you're logged in on this browser.</p>
           <details><summary>Error</summary><pre style="white-space:pre-wrap">${String(e)}</pre></details>
         </div>`;
     }
   }
 
-  async _subscribe() {
-    const conn = this._conn;
+  /* ---------- WS mode ---------- */
+  async _subscribeWS() {
+    const conn = this._client.conn;
     // Load initial states
     const resp = await conn.sendMessagePromise({ type: "get_states" });
     this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
-    await this._loadLog();
+    await this._loadLogWS();
     this.render();
 
-    // Subscribe to live updates
+    // Subscribe to live updates for update.* entities
     this._unsub = await conn.subscribeMessage(
       (evt) => {
         const ent = evt?.event?.data?.entity_id;
@@ -82,13 +150,34 @@ class BatchUpdatesPanel extends HTMLElement {
     );
   }
 
-  async _loadLog(limit = 100) {
-    const res = await this._conn.sendMessagePromise({ type: "ha_batch_updates/get_log", limit });
-    this._log = res.entries || [];
+  async _loadLogWS(limit = 100) {
+    const conn = this._client.conn;
+    try {
+      const res = await conn.sendMessagePromise({ type: "ha_batch_updates/get_log", limit });
+      this._log = res.entries || [];
+    } catch (e) {
+      console.warn("[Batch Updates] WS log fetch failed:", e);
+      this._log = [];
+    }
   }
+
+  /* ---------- REST mode ---------- */
+  async _loadOnceREST() {
+    const resp = await this._client.getStates();
+    this._states = Object.fromEntries(resp.map((s) => [s.entity_id, s]));
+    const res = await this._client.getLog(100);
+    this._log = res.entries || [];
+    this.render();
+  }
+
   async _clearLog() {
-    await this._conn.sendMessagePromise({ type: "ha_batch_updates/clear_log" });
-    await this._loadLog();
+    if (this._client.mode === "ws") {
+      await this._client.conn.sendMessagePromise({ type: "ha_batch_updates/clear_log" });
+      await this._loadLogWS();
+    } else {
+      await this._client.clearLog();
+      this._log = [];
+    }
     this.render();
   }
 
@@ -113,18 +202,30 @@ class BatchUpdatesPanel extends HTMLElement {
 
   async _run() {
     if (this._selected.size === 0) { alert("Select at least one update."); return; }
-    await this._conn.sendMessagePromise({
-      type: "call_service",
-      domain: "ha_batch_updates",
-      service: "run",
-      service_data: {
+    if (this._client.mode === "ws") {
+      await this._client.conn.sendMessagePromise({
+        type: "call_service",
+        domain: "ha_batch_updates",
+        service: "run",
+        service_data: {
+          entities: Array.from(this._selected),
+          reboot_host: this._reboot,
+          backup: this._backup,
+        },
+      });
+    } else {
+      await this._client.callService("ha_batch_updates", "run", {
         entities: Array.from(this._selected),
         reboot_host: this._reboot,
         backup: this._backup,
-      },
-    });
+      });
+    }
     this._toast("Batch started. Logs will appear below.");
-    setTimeout(async () => { await this._loadLog(); this.render(); }, 2000);
+    setTimeout(async () => {
+      if (this._client.mode === "ws") await this._loadLogWS();
+      else await this._loadOnceREST();
+      this.render();
+    }, 2000);
   }
 
   _row(s) {
@@ -248,40 +349,24 @@ class BatchUpdatesPanel extends HTMLElement {
     root.getElementById("backup").onchange = (e) => { this._backup = e.target.checked; };
     const refresh = root.getElementById("refreshLog");
     const clear = root.getElementById("clearLog");
-    if (refresh) refresh.onclick = async () => { await this._loadLog(); this.render(); };
+    if (refresh) refresh.onclick = async () => {
+      if (this._client.mode === "ws") { await this._loadLogWS(); }
+      else { await this._loadOnceREST(); }
+      this.render();
+    };
     if (clear) clear.onclick = async () => { if (confirm("Clear log?")) { await this._clearLog(); } };
   }
 }
 
 customElements.define("batch-updates-panel", BatchUpdatesPanel);
 
-/* ---------- Robust mount for multiple HA panel loader contracts ---------- */
-function mountInto(el) {
-  console.info("[Batch Updates] mountInto", el);
-  if (!el) el = document.body; // fallback
-  if (!el.querySelector("batch-updates-panel")) {
-    el.appendChild(document.createElement("batch-updates-panel"));
-  }
-}
-
-// Newer contract: window.customPanel = { default: { embed(el) {…} } }
-if (typeof window.customPanel === "object" && window.customPanel?.default?.embed) {
-  const old = window.customPanel.default.embed;
-  window.customPanel.default.embed = (el) => { try { old?.(el); } catch (e) {} mountInto(el); };
-} else if (typeof window.customPanel === "function") {
-  // Older contract: function(el)
-  const oldFn = window.customPanel;
-  window.customPanel = (el) => { try { oldFn?.(el); } catch (e) {} mountInto(el); };
-} else {
-  // If neither is present yet, define a handler HA can call
-  window.customPanel = (el) => mountInto(el);
-}
-
-// Also try mounting once DOM is ready (helps in some builds)
+// For iframe (no HA loader), just mount on DOM ready
 if (document.readyState === "complete" || document.readyState === "interactive") {
-  setTimeout(() => mountInto(document.getElementById("view") || document.body), 0);
+  setTimeout(() => document.body.appendChild(document.createElement("batch-updates-panel")), 0);
 } else {
-  document.addEventListener("DOMContentLoaded", () => mountInto(document.getElementById("view") || document.body));
+  document.addEventListener("DOMContentLoaded", () =>
+    document.body.appendChild(document.createElement("batch-updates-panel"))
+  );
 }
 
 console.info("%c[Batch Updates] panel script initialized", "color:#0b74de;font-weight:bold");
