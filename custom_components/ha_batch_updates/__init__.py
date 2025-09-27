@@ -20,8 +20,8 @@ except Exception:  # noqa: BLE001
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "ha_batch_updates"
-PANEL_URL_PATH = "batch-updates"  # sidebar path: /batch-updates
-STATIC_URL = f"/{DOMAIN}"         # static files served at /ha_batch_updates
+PANEL_URL_PATH = "batch-updates"   # sidebar path: /batch-updates
+STATIC_URL = f"/{DOMAIN}"          # static files served at /ha_batch_updates
 PANEL_TITLE = "Batch Updates"
 PANEL_ICON = "mdi:playlist-check"
 
@@ -50,7 +50,7 @@ class UpdateLog:
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
-    """Register static files, panel (iframe), log, WS, and service."""
+    """Register static files, iframe panel, log, WS, and service."""
     panel_fs_path = hass.config.path(f"custom_components/{DOMAIN}/panel")
 
     # ---- Serve panel assets (compat across HA versions) ----
@@ -66,25 +66,24 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         _LOGGER.error("Static path registration failed for %s: %s", DOMAIN, e)
         return False
 
-    # ---- Sidebar panel (admin-only) via iframe (rock-solid across builds) ----
+    # ---- Sidebar panel (admin-only) via IFRAME (avoids custom panel loader entirely) ----
     try:
         async_register_built_in_panel(
             hass,
-            component_name="custom",
+            component_name="iframe",  # IMPORTANT: use the iframe panel type
             sidebar_title=PANEL_TITLE,
             sidebar_icon=PANEL_ICON,
             frontend_url_path=PANEL_URL_PATH,
             config={
-                "embed_iframe": True,
-                # Serve the HTML which loads the JS module (relative path inside)
-                "url_path": f"{STATIC_URL}/batch-updates.html",
+                # 'url' is required by the iframe panel
+                "url": f"{STATIC_URL}/batch-updates.html"
             },
             require_admin=True,
         )
-        _LOGGER.info("%s panel registered at /%s (iframe -> %s/batch-updates.html)",
+        _LOGGER.info("%s iframe panel registered at /%s -> %s/batch-updates.html",
                      DOMAIN, PANEL_URL_PATH, STATIC_URL)
     except Exception as e:  # noqa: BLE001
-        _LOGGER.error("Failed to register sidebar panel: %s", e)
+        _LOGGER.error("Failed to register iframe sidebar panel: %s", e)
         return False
 
     # ---- Persistent log store ----
