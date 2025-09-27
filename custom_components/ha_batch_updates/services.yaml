@@ -1,15 +1,29 @@
 run:
   name: Run batch updates
-  description: Sequentially updates the provided update.* entities, halting on failure.
+  description: "Sequentially updates the provided update.* entities, halting on failure."
   fields:
     entities:
-      description: List of update.* entity_ids to install.
+      name: Entities
+      description: "List of update.* entity_ids to install."
       example:
         - update.esphome
         - update.hacs
+      required: true
+      selector:
+        entity:
+          domain: update
+          multiple: true
     reboot_host:
-      description: Reboot the host at the end (HA OS/Supervised). Otherwise restart core.
+      name: Reboot host at end
+      description: "Reboot the host at the end (HA OS/Supervised). Otherwise restart core."
       example: false
+      default: false
+      selector:
+        boolean: {}
     backup:
-      description: Pass backup: true to update.install (when supported).
+      name: Back up before updating
+      description: "Pass \"backup: true\" to update.install (when supported)."
       example: true
+      default: true
+      selector:
+        boolean: {}
