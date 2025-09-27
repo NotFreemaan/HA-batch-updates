@@ -3,7 +3,9 @@
 // - Status bar during run
 // - Log shows LOCAL time (UTC in tooltip)
 // - Hides entity_id next to names
-// - Icons for items (uses attributes.entity_picture when available; otherwise a neutral SVG avatar)
+// - Icons for items
+// - Per-item "i" button modal with changelog
+// - NEW: Fallback icon file (/ha-batch-updates-static/panel/update.svg) when no entity_picture
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
@@ -89,7 +91,6 @@ function getTZ() {
     Intl.DateTimeFormat().resolvedOptions().timeZone;
   return tz;
 }
-
 function fmtLocal(tsIso) {
   if (!tsIso) return "";
   try {
@@ -107,34 +108,96 @@ function fmtLocal(tsIso) {
       timeZoneName: "short",
     });
     return fmt.format(d);
-  } catch {
-    return tsIso;
-  }
+  } catch { return tsIso; }
 }
 
-/* ---------------- Small helpers for icons/avatars ---------------- */
+/* ---------------- Small helpers for icons ---------------- */
 function safeEntityPicture(url) {
   if (!url) return null;
   try {
-    // Absolute or HA-relative are fine. If it's protocol-relative, add current origin.
     if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")) return url;
     return `/${url.replace(/^\/+/, "")}`;
+  } catch { return null; }
+}
+// Use our bundled fallback icon (served by the integration's static path)
+function fallbackUpdateIcon() {
+  // This path is registered by the integration to serve files under /ha-batch-updates-static/
+  return "/ha-batch-updates-static/panel/update.svg";
+}
+
+/* ---------------- Changelog resolver ---------------- */
+async function fetchGitHubReleaseBody(releaseUrl) {
+  try {
+    const u = new URL(releaseUrl, location.origin);
+    if (u.hostname !== "github.com") return null;
+    const parts = u.pathname.split("/").filter(Boolean);
+    const owner = parts[0], repo = parts[1];
+    if (parts[2] !== "releases") return null;
+
+    let apiUrl;
+    if (parts[3] === "tag" && parts[4]) {
+      apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(parts[4])}`;
+    } else if (parts[3] === "latest") {
+      apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/latest`;
+    } else {
+      return null;
+    }
+
+    const res = await fetch(apiUrl, { headers: { "Accept": "application/vnd.github+json" } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const body = data.body || "";
+    const tag = data.tag_name || "";
+    const name = data.name || "";
+    return { body, tag, name };
   } catch {
     return null;
   }
 }
 
-function fallbackAvatarSVG(label = "") {
-  // Neutral puzzle-ish avatar with initials (first letter of label)
-  const ch = (label || "?").trim().charAt(0).toUpperCase() || "?";
-  const bg = "#607D8B";
-  const fg = "#FFFFFF";
-  const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28" role="img" aria-label="${ch}">
-      <rect width="28" height="28" rx="6" fill="${bg}"/>
-      <text x="50%" y="58%" text-anchor="middle" font-size="14" font-family="Inter,system-ui,Segoe UI,Roboto" fill="${fg}" font-weight="700">${ch}</text>
-    </svg>`;
-  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+async function buildChangelogHTML(stateObj) {
+  const attr = stateObj?.attributes || {};
+  const title = attr.title || attr.friendly_name || stateObj?.entity_id || "Item";
+  const from = attr.installed_version || "";
+  const to = attr.latest_version || "";
+  const releaseSummary = attr.release_summary || attr.release_notes || "";
+  const releaseUrl = attr.release_url || attr.release_url_template || "";
+
+  if (releaseSummary) {
+    return `
+      <h2>${title}</h2>
+      <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
+      <div class="md">${escapeHTML(releaseSummary)}</div>
+      ${releaseUrl ? `<p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
+    `;
+  }
+
+  if (releaseUrl && /github\.com\/.+\/releases\//i.test(releaseUrl)) {
+    const gh = await fetchGitHubReleaseBody(releaseUrl);
+    if (gh && (gh.body || gh.name || gh.tag)) {
+      return `
+        <h2>${title}</h2>
+        <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
+        ${gh.name || gh.tag ? `<p class="subtitle">${escapeHTML(gh.name || gh.tag)}</p>` : ""}
+        <pre class="prewrap">${escapeHTML(gh.body || "No release notes provided.")}</pre>
+        <p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open on GitHub</a></p>
+      `;
+    }
+  }
+
+  return `
+    <h2>${title}</h2>
+    <p class="vers">${from ? `${from} &rarr; ` : ""}${to || ""}</p>
+    <p>No changelog text available.</p>
+    ${releaseUrl ? `<p><a href="${releaseUrl}" target="_blank" rel="noreferrer">Open release page</a></p>` : ""}
+  `;
+}
+
+function escapeHTML(str) {
+  return String(str)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 /* ---------------- Web Component ---------------- */
@@ -250,7 +313,6 @@ class BatchUpdatesPanel extends HTMLElement {
     }
     return false;
   }
-
   _allSelectedFinishedOrIdle() {
     const ids = Array.from(this._selected);
     for (const id of ids) {
@@ -320,6 +382,29 @@ class BatchUpdatesPanel extends HTMLElement {
     }
   }
 
+  async _showInfo(entityId) {
+    const s = this._states[entityId];
+    if (!s) return;
+    const modal = this.shadowRoot.getElementById("modal");
+    const body = this.shadowRoot.querySelector(".modal-body");
+    const footer = this.shadowRoot.querySelector(".modal-footer");
+    body.innerHTML = `<div class="loading"><span class="spinner dark"></span> Loading changelog…</div>`;
+    modal.classList.add("open");
+
+    try {
+      const html = await buildChangelogHTML(s);
+      body.innerHTML = html;
+      footer.innerHTML = `
+        ${s.attributes?.release_url ? `<a class="btn btn-ghost" href="${s.attributes.release_url}" target="_blank" rel="noreferrer">Open release</a>` : ""}
+        <button class="btn btn-raised" id="modal-close-2">Close</button>
+      `;
+      const c2 = this.shadowRoot.getElementById("modal-close-2");
+      if (c2) c2.onclick = () => modal.classList.remove("open");
+    } catch (e) {
+      body.innerHTML = `<p>Could not load changelog.</p><pre class="prewrap">${escapeHTML(String(e))}</pre>`;
+    }
+  }
+
   _row(s) {
     const id = s.entity_id;
     const name = s.attributes.friendly_name || id;
@@ -328,26 +413,27 @@ class BatchUpdatesPanel extends HTMLElement {
     const inprog = s.attributes.in_progress === true;
 
     const picAttr = safeEntityPicture(s.attributes?.entity_picture);
-    const avatar = picAttr || fallbackAvatarSVG(name);
+    const avatar = picAttr || fallbackUpdateIcon();
 
     return `
       <li class="row">
         <label class="left">
           <img class="avatar" src="${avatar}" alt="" loading="lazy" referrerpolicy="no-referrer" />
           <input type="checkbox" data-ent="${id}" ${this._selected.has(id) ? "checked" : ""} ${inprog || this._running ? "disabled" : ""}>
-          <span class="name">${name}</span>
+          <span class="name" title="${name}">${name}</span>
         </label>
         <span class="ver">
           ${verFrom ? `${verFrom} ` : ""}${verTo ? `&rarr; ${verTo}` : ""}
           ${inprog ? ' <span class="spinner" aria-label="In progress"></span>' : ''}
+          <button class="btn btn-chip info" data-info="${id}" title="Show changelog">i</button>
         </span>
       </li>
     `;
   }
 
   _logRow(e) {
-    const utc = e.ts || "";                            // original UTC
-    const local = utc ? fmtLocal(utc) : "";            // formatted local
+    const utc = e.ts || "";
+    const local = utc ? fmtLocal(utc) : "";
     const name = e.friendly_name || e.entity_id || e.type;
     const result = e.result || e.type;
     const reason = e.reason || e.action || "";
@@ -424,6 +510,22 @@ class BatchUpdatesPanel extends HTMLElement {
         </div>
 
         <div class="toast" role="status" aria-live="polite"></div>
+
+        <!-- Modal -->
+        <div id="modal" class="modal" aria-hidden="true">
+          <div class="modal-card" role="dialog" aria-modal="true" aria-label="Changelog">
+            <div class="modal-head">
+              <strong>Changelog</strong>
+              <button class="btn btn-ghost" id="modal-close" aria-label="Close">×</button>
+            </div>
+            <div class="modal-body">
+              <!-- dynamic -->
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-raised" id="modal-close-1">Close</button>
+            </div>
+          </div>
+        </div>
       </ha-card>
 
       <style>
@@ -451,9 +553,13 @@ class BatchUpdatesPanel extends HTMLElement {
           display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.6);
           border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px
         }
+        .spinner.dark{
+          border-color: rgba(0,0,0,.25);
+          border-top-color: rgba(0,0,0,.65);
+        }
         @keyframes spin{to{transform:rotate(360deg)}}
 
-        /* Buttons (with safe fallbacks so they're never "invisible") */
+        /* Buttons */
         .btn{
           appearance:none;border:0;cursor:pointer;padding:8px 12px;
           border-radius:12px;font-weight:600;transition:box-shadow .15s, filter .15s;
@@ -476,6 +582,9 @@ class BatchUpdatesPanel extends HTMLElement {
         .btn-ghost{
           background:transparent;color:var(--primary-text-color, #111111);
           box-shadow:none;opacity:.9
+        }
+        .btn-chip{
+          padding:4px 8px;border-radius:999px;font-size:.82em;line-height:1.2;margin-left:8px
         }
 
         .count-pill{
@@ -512,6 +621,25 @@ class BatchUpdatesPanel extends HTMLElement {
           opacity:0;pointer-events:none;transition:opacity .2s;
         }
         .toast.show{opacity:1}
+
+        /* Modal */
+        .modal{
+          position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+          background:rgba(0,0,0,.4);z-index:9999;padding:20px
+        }
+        .modal.open{display:flex}
+        .modal-card{
+          width:min(820px, 96vw);max-height:85vh;overflow:auto;border-radius:16px;
+          background:var(--card-background-color, #fff);color:var(--primary-text-color, #111);
+          box-shadow:0 10px 30px rgba(0,0,0,.25)
+        }
+        .modal-head{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--divider-color,#e0e0e0)}
+        .modal-body{padding:16px}
+        .modal-footer{padding:14px 16px;border-top:1px solid var(--divider-color,#e0e0e0);display:flex;gap:10px;justify-content:flex-end}
+        .prewrap{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+        .vers{opacity:.8;margin:.2rem 0 .6rem}
+        .subtitle{opacity:.85;margin:.2rem 0 1rem}
+        .loading{display:flex;align-items:center;gap:8px}
       </style>
     `;
     this.shadowRoot.innerHTML = html;
@@ -519,8 +647,14 @@ class BatchUpdatesPanel extends HTMLElement {
     const root = this.shadowRoot;
     const cs = (id) => root.getElementById(id);
 
-    const closeBtn = root.querySelector(".close-status");
-    if (closeBtn) closeBtn.onclick = () => {
+    const closeBtn = root.getElementById("modal-close");
+    const closeBtn1 = root.getElementById("modal-close-1");
+    const modal = root.getElementById("modal");
+    if (closeBtn) closeBtn.onclick = () => modal.classList.remove("open");
+    if (closeBtn1) closeBtn1.onclick = () => modal.classList.remove("open");
+
+    const statusClose = root.querySelector(".close-status");
+    if (statusClose) statusClose.onclick = () => {
       this._running = false;
       if (this._runWatchTimer) { clearInterval(this._runWatchTimer); this._runWatchTimer = null; }
       this.render();
@@ -544,6 +678,11 @@ class BatchUpdatesPanel extends HTMLElement {
       this.render();
     };
     if (clear) clear.onclick = async () => { if (confirm("Clear log?")) { await this._clearLog(); } };
+
+    // Wire "i" info buttons
+    root.querySelectorAll('button[data-info]').forEach(btn => {
+      btn.onclick = () => this._showInfo(btn.dataset.info);
+    });
   }
 }
 
