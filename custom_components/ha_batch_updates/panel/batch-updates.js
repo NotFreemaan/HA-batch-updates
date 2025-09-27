@@ -1,7 +1,9 @@
 // Batch Updates panel – iframe-aware, WS/REST client
-// - Buttons are native <button>
+// - Native <button> controls
+// - Status bar during run
+// - Log shows LOCAL time (UTC in tooltip)
 // - Hides entity_id next to names
-// - Shows a status bar while batch is running and disables controls
+// - Icons for items (uses attributes.entity_picture when available; otherwise a neutral SVG avatar)
 
 console.info("%c[Batch Updates] panel script loaded", "color:#0b74de;font-weight:bold");
 
@@ -77,6 +79,62 @@ async function getHAClient(timeoutMs = 15000) {
     },
   };
   return rest;
+}
+
+/* ---------------- Time formatting (LOCAL) ---------------- */
+function getTZ() {
+  const tz =
+    window?.parent?.hass?.config?.time_zone ||
+    window?.top?.hass?.config?.time_zone ||
+    Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return tz;
+}
+
+function fmtLocal(tsIso) {
+  if (!tsIso) return "";
+  try {
+    const tz = getTZ();
+    const d = new Date(tsIso);
+    const fmt = new Intl.DateTimeFormat(undefined, {
+      timeZone: tz,
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+      timeZoneName: "short",
+    });
+    return fmt.format(d);
+  } catch {
+    return tsIso;
+  }
+}
+
+/* ---------------- Small helpers for icons/avatars ---------------- */
+function safeEntityPicture(url) {
+  if (!url) return null;
+  try {
+    // Absolute or HA-relative are fine. If it's protocol-relative, add current origin.
+    if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")) return url;
+    return `/${url.replace(/^\/+/, "")}`;
+  } catch {
+    return null;
+  }
+}
+
+function fallbackAvatarSVG(label = "") {
+  // Neutral puzzle-ish avatar with initials (first letter of label)
+  const ch = (label || "?").trim().charAt(0).toUpperCase() || "?";
+  const bg = "#607D8B";
+  const fg = "#FFFFFF";
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28" role="img" aria-label="${ch}">
+      <rect width="28" height="28" rx="6" fill="${bg}"/>
+      <text x="50%" y="58%" text-anchor="middle" font-size="14" font-family="Inter,system-ui,Segoe UI,Roboto" fill="${fg}" font-weight="700">${ch}</text>
+    </svg>`;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
 /* ---------------- Web Component ---------------- */
@@ -194,7 +252,6 @@ class BatchUpdatesPanel extends HTMLElement {
   }
 
   _allSelectedFinishedOrIdle() {
-    // Finished when none of the selected are 'on' with in_progress true
     const ids = Array.from(this._selected);
     for (const id of ids) {
       const st = this._states[id];
@@ -206,7 +263,6 @@ class BatchUpdatesPanel extends HTMLElement {
 
   _startRunWatcher() {
     if (this._runWatchTimer) clearInterval(this._runWatchTimer);
-    // Every 2s, if in WS mode, refresh states; in REST, refetch states
     this._runWatchTimer = setInterval(async () => {
       try {
         if (this._client.mode === "ws") {
@@ -270,19 +326,28 @@ class BatchUpdatesPanel extends HTMLElement {
     const verTo = s.attributes.latest_version || "";
     const verFrom = s.attributes.installed_version || "";
     const inprog = s.attributes.in_progress === true;
+
+    const picAttr = safeEntityPicture(s.attributes?.entity_picture);
+    const avatar = picAttr || fallbackAvatarSVG(name);
+
     return `
       <li class="row">
         <label class="left">
+          <img class="avatar" src="${avatar}" alt="" loading="lazy" referrerpolicy="no-referrer" />
           <input type="checkbox" data-ent="${id}" ${this._selected.has(id) ? "checked" : ""} ${inprog || this._running ? "disabled" : ""}>
           <span class="name">${name}</span>
         </label>
-        <span class="ver">${verFrom ? `${verFrom} ` : ""}${verTo ? `&rarr; ${verTo}` : ""}${inprog ? ' <span class="spinner" aria-label="In progress"></span>' : ''}</span>
+        <span class="ver">
+          ${verFrom ? `${verFrom} ` : ""}${verTo ? `&rarr; ${verTo}` : ""}
+          ${inprog ? ' <span class="spinner" aria-label="In progress"></span>' : ''}
+        </span>
       </li>
     `;
   }
 
   _logRow(e) {
-    const ts = e.ts || "";
+    const utc = e.ts || "";                            // original UTC
+    const local = utc ? fmtLocal(utc) : "";            // formatted local
     const name = e.friendly_name || e.entity_id || e.type;
     const result = e.result || e.type;
     const reason = e.reason || e.action || "";
@@ -291,8 +356,8 @@ class BatchUpdatesPanel extends HTMLElement {
     else if (String(result).startsWith("failed")) badge = "err";
     else if (result === "started") badge = "warn";
     return `
-      <tr>
-        <td class="ts">${ts}</td>
+      <tr title="UTC: ${utc}">
+        <td class="ts">${local}</td>
         <td class="name">${name}</td>
         <td class="res"><span class="badge ${badge}">${result}</span></td>
         <td class="reason">${reason}</td>
@@ -353,7 +418,7 @@ class BatchUpdatesPanel extends HTMLElement {
             <button id="clearLog" class="btn btn-ghost" aria-label="Clear log">Clear log</button>
           </div>
           <table>
-            <thead><tr><th>Time (UTC)</th><th>Item</th><th>Result</th><th>Reason / Action</th></tr></thead>
+            <thead><tr><th>Time (local)</th><th>Item</th><th>Result</th><th>Reason / Action</th></tr></thead>
             <tbody>${this._log.slice().reverse().map((e) => this._logRow(e)).join("")}</tbody>
           </table>
         </div>
@@ -379,9 +444,7 @@ class BatchUpdatesPanel extends HTMLElement {
           background:var(--info-color, #0b74de);color:#fff;border-top-left-radius:12px;border-top-right-radius:12px
         }
         .statusbar .muted{opacity:.9}
-        .close-status{
-          margin-left:auto
-        }
+        .close-status{margin-left:auto}
 
         /* Spinner */
         .spinner{
@@ -390,45 +453,51 @@ class BatchUpdatesPanel extends HTMLElement {
         }
         @keyframes spin{to{transform:rotate(360deg)}}
 
-        /* Buttons */
+        /* Buttons (with safe fallbacks so they're never "invisible") */
         .btn{
           appearance:none;border:0;cursor:pointer;padding:8px 12px;
           border-radius:12px;font-weight:600;transition:box-shadow .15s, filter .15s;
-          background:var(--card-background-color,#fff);color:var(--primary-text-color,#111);
-          box-shadow:inset 0 0 0 2px var(--divider-color,#ccc);
+          background:var(--card-background-color, #ffffff);color:var(--primary-text-color, #111111);
+          box-shadow:inset 0 0 0 2px var(--divider-color, #c7c7c7);
         }
         .btn[disabled]{opacity:.6;cursor:not-allowed}
         .btn:hover{filter:brightness(0.98)}
-        .btn:focus{outline:2px solid var(--primary-color);outline-offset:2px}
+        .btn:focus{outline:2px solid var(--primary-color, #0b74de);outline-offset:2px}
         .btn-raised{
-          background:var(--primary-color);color:#fff;box-shadow:none;
+          background:var(--primary-color, #0b74de);
+          color:var(--text-on-primary, #ffffff);
+          box-shadow:inset 0 0 0 2px rgba(0,0,0,.08);
+          border:1px solid rgba(0,0,0,.08);
         }
         .btn-raised:hover{filter:brightness(1.02)}
         .btn-outlined{
-          background:transparent;color:var(--primary-text-color,#111);
+          background:transparent;color:var(--primary-text-color, #111111);
         }
         .btn-ghost{
-          background:transparent;color:var(--primary-text-color,#111);
+          background:transparent;color:var(--primary-text-color, #111111);
           box-shadow:none;opacity:.9
         }
 
         .count-pill{
           display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;
-          font-weight:700;font-size:.9em;background: var(--primary-color);color: white;line-height:1.8;
+          font-weight:700;font-size:.9em;background: var(--primary-color, #0b74de);color: white;line-height:1.8;
         }
 
         ul{list-style:none;margin:0;padding:0}
         .row{display:flex;align-items:center;justify-content:space-between;
-             border-bottom:1px solid var(--divider-color);padding:10px 0}
-        .left{display:flex;align-items:center;gap:10px}
-        .name{font-weight:600}
-        .ver{opacity:.9}
-        /* Removed .eid display */
+             border-bottom:1px solid var(--divider-color, #e0e0e0);padding:10px 0}
+        .left{display:flex;align-items:center;gap:10px;min-width:0}
+        .avatar{
+          width:28px;height:28px;border-radius:6px;flex:0 0 28px;object-fit:cover;
+          box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)
+        }
+        .name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ver{opacity:.9;white-space:nowrap}
 
         .log{padding:0 16px 16px}
         .logbar{display:flex;align-items:center;margin:8px 0}
         table{width:100%;border-collapse:collapse}
-        th,td{padding:8px;border-bottom:1px solid var(--divider-color);text-align:left}
+        th,td{padding:8px;border-bottom:1px solid var(--divider-color, #e0e0e0);text-align:left}
         .badge{padding:2px 8px;border-radius:12px;font-size:.85em}
         .badge.ok{background:var(--success-color,#0f9d58);color:white}
         .badge.err{background:var(--error-color,#d93025);color:white}
