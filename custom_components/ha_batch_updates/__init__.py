@@ -78,7 +78,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             frontend_url_path=PANEL_URL_PATH,
             config={
                 "embed_iframe": False,
-                # Give HA both formats; it will use what it prefers
+                # Provide BOTH formats; different HA builds prefer one or the other
                 "module_url": f"{STATIC_URL}/batch-updates.js",
                 "html_url": f"{STATIC_URL}/batch-updates.html",
             },
