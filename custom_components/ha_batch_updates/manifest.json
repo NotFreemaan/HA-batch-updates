@@ -1,7 +1,7 @@
 {
   "domain": "ha_batch_updates",
   "name": "Batch Updates (Sidebar)",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "documentation": "https://github.com/NotFreemaan/ha-batch-updates",
   "requirements": [],
   "codeowners": ["@NotFreemaan"],
